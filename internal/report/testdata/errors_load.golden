@@ -1,0 +1,31 @@
+# pagevet 0.1.0  load failures  started 2026-08-14T11:02:30Z
+# No usable response arrived: DNS, TLS, refused connection, blocked request,
+# renderer crash, or the per-URL deadline expiring.
+
+#0005  https://nope.invalid/
+       status   -             outcome=load_error
+       net      net::ERR_NAME_NOT_RESOLVED  class=DNS
+       elapsed  0.12s  settled_by=netfail
+
+#0006  https://slow.example.com/hang
+       status   200 OK        outcome=timeout
+       timeout  deadline 30s exceeded
+       elapsed  30.00s  settled_by=deadline
+       also     console_error 1 error(s)   (see errors-console.log #0006)
+
+#0008  https://slow.example.com/never
+       status   -             outcome=timeout
+       timeout  deadline 30s exceeded
+       elapsed  30.00s  settled_by=deadline
+
+#0009  https://ads.example.net/pixel
+       status   -             outcome=load_error
+       net      net::ERR_BLOCKED_BY_CLIENT  class=BLOCKED
+       blocked  inspector
+       elapsed  0.09s  settled_by=netfail
+
+#0010  https://heavy.example.com/render
+       status   -             outcome=load_error
+       crashed  renderer process died before the page settled
+       elapsed  4.50s  settled_by=crash
+

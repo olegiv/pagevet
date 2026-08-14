@@ -1,0 +1,11 @@
+{"type":"header","log":"opened.log","tool":"pagevet","version":"0.1.0","started_at":"2026-08-14T11:02:30Z","input":"urls.txt","concurrency":4,"timeout":"30s","settle":"1.5s","chrome":"Google Chrome 151.0.7922.138 (headless, JavaScript enabled)"}
+{"ts":"2026-08-14T11:02:31Z","i":1,"outcome":"ok","status":200,"duration_ms":840,"url":"https://example.com/"}
+{"ts":"2026-08-14T11:02:30Z","i":2,"outcome":"http_error","status":404,"duration_ms":420,"url":"https://example.com/missing"}
+{"ts":"2026-08-14T11:02:33Z","i":3,"outcome":"console_error","status":200,"duration_ms":1920,"url":"https://shop.example.com/cart","console":2,"console_events":4}
+{"ts":"2026-08-14T11:02:32Z","i":4,"outcome":"subresource_error","status":200,"duration_ms":1310,"url":"https://example.com/gallery","resources":3}
+{"ts":"2026-08-14T11:02:34Z","i":5,"outcome":"load_error","status":0,"duration_ms":120,"url":"https://nope.invalid/","net_error":"net::ERR_NAME_NOT_RESOLVED"}
+{"ts":"2026-08-14T11:03:02Z","i":6,"outcome":"timeout","status":200,"duration_ms":30000,"url":"https://slow.example.com/hang","console":1,"console_events":2}
+{"ts":"2026-08-14T11:02:34Z","i":7,"outcome":"http_error","status":500,"duration_ms":760,"url":"https://shop.example.com/checkout?step=2&ref=nav","console":1,"console_events":9}
+{"ts":"2026-08-14T11:03:05Z","i":8,"outcome":"timeout","status":0,"duration_ms":30000,"url":"https://slow.example.com/never"}
+{"ts":"2026-08-14T11:02:35Z","i":9,"outcome":"load_error","status":0,"duration_ms":90,"url":"https://ads.example.net/pixel","net_error":"net::ERR_BLOCKED_BY_CLIENT"}
+{"ts":"2026-08-14T11:02:39Z","i":10,"outcome":"load_error","status":0,"duration_ms":4500,"url":"https://heavy.example.com/render"}

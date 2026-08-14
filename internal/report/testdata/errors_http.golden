@@ -1,0 +1,17 @@
+# pagevet 0.1.0  HTTP status errors  started 2026-08-14T11:02:30Z
+# Main-document responses whose FINAL status is outside the acceptable
+# band (200-399). Intermediate 3xx hops are listed, not counted as errors.
+
+#0002  https://example.com/missing
+       status   404 Not Found outcome=http_error
+       final    https://www.example.com/missing
+       remote   127.0.0.1:PORT  http/1.1
+       redirect 2 hop(s)
+                1. 301  https://example.com/missing
+                2. 302  https://example.com/moved
+
+#0007  https://shop.example.com/checkout?step=2&ref=nav
+       status   500 Internal Server Error  outcome=http_error
+       remote   203.0.113.9  h2
+       also     console_error 1 error(s)   (see errors-console.log #0007)
+

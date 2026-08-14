@@ -1,0 +1,11 @@
+# pagevet 0.1.0  failed subresources  started 2026-08-14T11:02:30Z
+# Assets the page requested that never loaded: scripts, stylesheets, images,
+# fonts, XHR/fetch. The page's own document status was acceptable.
+
+#0004  https://example.com/gallery
+       status   200 OK        outcome=subresource_error
+       3 distinct failure(s), 5 occurrence(s)
+       1. [Image]         404                         x2   https://cdn.example.com/img/hero.png
+       2. [Script]        net::ERR_CONNECTION_REFUSED x1   https://a.example.net/track.js
+       3. [Stylesheet]    -                           x2   https://cdn.example.com/style/print.css
+

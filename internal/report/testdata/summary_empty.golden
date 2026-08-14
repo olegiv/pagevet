@@ -1,0 +1,15 @@
+pagevet summary
+──────────────────────────────────────────────────────────
+input                  urls.txt
+lines read                  0
+attempted                   0
+
+ok                          0
+errored                     0
+
+0 + 0 + 0 + 0 + 0 + 0 = 0   ✓ every URL counted exactly once
+
+browser                Google Chrome 151.0.7922.138 (headless, JavaScript enabled)
+elapsed                41.3s
+logs                   logs/results.jsonl
+exit code              0  (run completed; no errors)

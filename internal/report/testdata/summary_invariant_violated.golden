@@ -1,0 +1,34 @@
+pagevet summary
+──────────────────────────────────────────────────────────
+input                  urls.txt
+lines read                 22
+  blank / comment / dup     3
+  invalid URLs              1   (see stderr)
+attempted                  18
+
+ok                          7
+errored                    11
+  http errors               2
+  console errors            1
+  subresource errors        1
+  load errors               3
+  timeouts                  2
+
+7 + 2 + 1 + 1 + 3 + 2 = 16
+!! MISCOUNT: 18 URLs attempted but outcomes sum to 16 — this is a bug in pagevet, not in the pages
+
+detail (a URL may appear in more than one line below)
+  pages with console errors     3
+  console error events         15      3 message(s) suppressed by -max-console
+  pages with failed subresources 1
+  subresource failure events    5
+  redirected pages              1
+
+http status breakdown
+  200   6    204   1    301   2    304   1    404   1
+  500   1
+
+browser                Google Chrome 151.0.7922.138 (headless, JavaScript enabled)
+elapsed                41.3s
+logs                   logs/results.jsonl
+exit code              0  (run completed; 11 URLs had errors)

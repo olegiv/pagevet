@@ -1,0 +1,10 @@
+# staging smoke list
+https://example.test/
+
+http://example.test/a?x=1#frag
+HTTP://EXAMPLE.TEST/a?x=1
+javascript:alert(1)
+   # indented comment
+https://example.test/b
+https://example.test/
+/relative

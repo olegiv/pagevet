@@ -1,0 +1,13 @@
+# pagevet 0.1.0  started 2026-08-14T11:02:30Z  input=urls.txt  concurrency=4  timeout=30s  settle=1.5s
+# chrome Google Chrome 151.0.7922.138 (headless, JavaScript enabled)
+# ts                    n      outcome             status  elapsed  url
+2026-08-14T11:02:31Z    #0001  ok                     200    0.84s  https://example.com/
+2026-08-14T11:02:30Z    #0002  http_error             404    0.42s  https://example.com/missing
+2026-08-14T11:02:33Z    #0003  console_error          200    1.92s  https://shop.example.com/cart   js=2/4
+2026-08-14T11:02:32Z    #0004  subresource_error      200    1.31s  https://example.com/gallery   res=3
+2026-08-14T11:02:34Z    #0005  load_error               -    0.12s  https://nope.invalid/   net::ERR_NAME_NOT_RESOLVED
+2026-08-14T11:03:02Z    #0006  timeout                200   30.00s  https://slow.example.com/hang   js=1/2
+2026-08-14T11:02:34Z    #0007  http_error             500    0.76s  https://shop.example.com/checkout?step=2&ref=nav   js=1/9
+2026-08-14T11:03:05Z    #0008  timeout                  -   30.00s  https://slow.example.com/never
+2026-08-14T11:02:35Z    #0009  load_error               -    0.09s  https://ads.example.net/pixel   net::ERR_BLOCKED_BY_CLIENT  blocked=inspector
+2026-08-14T11:02:39Z    #0010  load_error               -    4.50s  https://heavy.example.com/render

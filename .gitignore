@@ -1,0 +1,20 @@
+# Build output
+/pagevet
+
+# Default -out directory: crawl results contain the URLs you supplied,
+# credentials and all. Never commit them.
+/logs/
+
+# Coverage artifacts
+coverage*.out
+cover.html
+
+# Local Claude Code settings are personal, not team-wide.
+# Team-wide permissions belong in .claude/settings.json, which IS committed.
+.claude/settings.local.json
+
+# Security audit results stay local.
+.audit/
+
+# macOS
+.DS_Store

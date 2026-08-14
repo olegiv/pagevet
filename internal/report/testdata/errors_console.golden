@@ -1,0 +1,26 @@
+# pagevet 0.1.0  browser console errors  started 2026-08-14T11:02:30Z
+# Uncaught JS exceptions, unhandled promise rejections, console.error(), and
+# browser-side JS errors (CSP refusals, parse-time SyntaxError).
+
+#0003  https://shop.example.com/cart
+       status   200 OK        outcome=console_error
+       2 distinct error(s), 4 occurrence(s)
+       1. [exception]      x3   TypeError: Cannot read properties of null (reading 'total')
+                                at updateTotal (https://shop.example.com/static/cart.js:118:24)
+       2. [console.error]  x1   checkout: price sync failed 503
+       + 3 occurrence(s) suppressed by -max-console
+
+#0006  https://slow.example.com/hang
+       status   200 OK        outcome=console_error
+       1 distinct error(s), 2 occurrence(s)
+       1. [browser.log]    x2   Refused to connect to 'wss://live.example.com/socket' because it violates the Content Security Policy directive
+                                at https://slow.example.com/hang:1:1
+       also     timeout   (see errors-load.log #0006)
+
+#0007  https://shop.example.com/checkout?step=2&ref=nav
+       status   500 Internal Server Error  outcome=console_error
+       1 distinct error(s), 9 occurrence(s)
+       1. [exception]      x9   TypeError: Cannot read properties of null (reading 'total')
+                                at updateTotal (https://shop.example.com/static/cart.js:118:24)
+       also     http_error 500   (see errors-http.log #0007)
+
