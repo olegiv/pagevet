@@ -383,6 +383,38 @@ func TestLogin_CheckHostReachesTheLoader(t *testing.T) {
 	}
 }
 
+// TestLogin_InterruptDuringHostCheckStopsBeforeChrome closes a gap the address
+// guard's own doc comment predicted.
+//
+// input.CheckHost treats a canceled resolver like any DNS failure and returns
+// nil — an unresolvable name is Chrome's story to tell, not the guard's — which
+// leaves the CALLER responsible for noticing. Without that check a Ctrl-C
+// during the lookup walked straight into NewChrome, whose launch is rooted in
+// context.Background and therefore cannot be interrupted: up to the
+// browser-start timeout spent starting a browser nobody wants, and exit 3 if it
+// failed on the way.
+func TestLogin_InterruptDuringHostCheckStopsBeforeChrome(t *testing.T) {
+	chdirWithEnv(t, envBody)
+
+	cfg := loginCfg(t, "https://example.com/")
+
+	// Fail the test if the browser is constructed at all.
+	factory := func(loader.Options) (browser, error) {
+		t.Error("Chrome was constructed after the run had already been interrupted")
+		return &fakeBrowser{FakeLoader: fake.New()}, nil
+	}
+
+	ctx, cancel := context.WithCancel(deadline(t))
+	cancel()
+
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, cfg, factory, &stdout, &stderr)
+
+	if code != ExitInterrupted {
+		t.Errorf("run() = %d, want %d (ExitInterrupted)", code, ExitInterrupted)
+	}
+}
+
 func TestLogin_EnvIsReadBeforeChromeStarts(t *testing.T) {
 	chdirWithEnv(t, "") // no .env at all
 

@@ -148,8 +148,8 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// only. Nothing is ever queried with it.
 	formSel := fmt.Sprintf("[id=%s]", cssString(spec.FormID))
 	formLabel := "#" + spec.FormID
-	userSel := fmt.Sprintf("%s [name=%s]", formSel, cssString(spec.UserField))
-	passSel := fmt.Sprintf("%s [name=%s]", formSel, cssString(spec.PassField))
+	userSel := fieldSelector(spec.FormID, spec.UserField)
+	passSel := fieldSelector(spec.FormID, spec.PassField)
 
 	// Sign out first, when LOGOUT_PATH says how.
 	//
@@ -200,6 +200,21 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 			ErrLoginFailed, formLabel, b.display(spec.URL), findErr)
 	}
 
+	// Choose the submit control BEFORE filling anything: the destination check
+	// below consults it, since a submitter's formaction overrides the form's
+	// action, and submit() reuses the mark rather than choosing again.
+	if _, markErr := b.markClickableSubmit(ctx, spec.FormID); markErr != nil {
+		return fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, markErr)
+	}
+
+	// Where would this form POST? An allowed login page can host a form whose
+	// action points at a blocked address, and a cross-origin form submission
+	// needs no CORS permission — so this has to be settled before the password
+	// is typed, not after.
+	if destErr := b.checkSubmitDestination(ctx, spec, spec.FormID); destErr != nil {
+		return destErr
+	}
+
 	// Fill both fields. Errors below name the SELECTOR, never the value.
 	switch timedOut, findErr := b.runFind(ctx, b.fillField(userSel, spec.Username)); {
 	case timedOut:
@@ -218,7 +233,7 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	}
 
 	// submit builds its own message, including the ErrLoginFailed wrapper.
-	if submitErr := b.submit(ctx, formSel, formLabel, spec.FormID); submitErr != nil {
+	if submitErr := b.submit(ctx, formLabel, spec.FormID); submitErr != nil {
 		return submitErr
 	}
 
@@ -259,6 +274,20 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	return nil
 }
 
+// fieldSelector matches a named control of the form, whether it sits inside the
+// form element or is associated with it from outside.
+//
+// The second half is not exotic HTML. `<input name="pass" form="login-form">`
+// placed anywhere in the document is a member of that form: the browser puts it
+// in form.elements and submits it normally. A descendant selector alone misses
+// it entirely, and the symptom is the least helpful one possible — the field
+// times out and the run reports "no field named pass", pointing the user at a
+// PASSWORD_NAME that was right all along.
+func fieldSelector(formID, fieldName string) string {
+	id, name := cssString(formID), cssString(fieldName)
+	return fmt.Sprintf("[id=%s] [name=%s], [form=%s][name=%s]", id, name, id, name)
+}
+
 // fillField types value into the field at sel, REPLACING whatever is there.
 //
 // SendKeys alone appends: it focuses the field and types, so a server-prefilled
@@ -296,22 +325,33 @@ func (b *Browser) fillField(sel, value string) chromedp.Action {
 	}
 }
 
-// submit sends the filled-in form and waits for the resulting navigation.
+// submitControls is the query for a form's submit controls. A <button> with no
+// type attribute is a submit button per the HTML spec, but [type="submit"]
+// matches on the attribute being literally present, so both are needed.
+const submitControls = `[type="submit"], button:not([type])`
+
+// submitMarker is stamped on the control this run intends to click, so Go can
+// address the exact element JavaScript chose. querySelector returns only the
+// FIRST match, and the first submit control is not always the usable one — a
+// hidden control followed by the real Sign in button is an ordinary layout.
+// Picking by position in CSS cannot express "the first visible one".
+const submitMarker = "data-pagevet-submit"
+
+// submit sends the filled-in form.
 //
-// EXACTLY ONE submission is ever dispatched. This used to try three ways in
-// turn and fall through on failure, which had a nasty edge: a login POST slower
-// than one step's slice of the budget looks identical to a submission that
+// EXACTLY ONE submission is ever dispatched. An earlier version tried three
+// methods in turn and fell through on failure, which had a nasty edge: a POST
+// slower than one step's slice of the budget is indistinguishable from one that
 // never happened, because the old document keeps rendering the form until the
-// response commits. The loop would then submit the credentials a SECOND time —
+// response commits. The loop would then send the credentials a SECOND time —
 // spending a one-time CSRF token, tripping rate limits, or walking an account
-// into a lockout. A slow server must not be able to cause that.
+// toward a lockout.
 //
-// So the method is chosen up front from the DOM, and then it gets the whole
-// remaining login budget:
+// So the method is chosen up front from the DOM:
 //
-//   - A submit control that is actually clickable is clicked. Highest fidelity,
-//     and some sites bind their handler to the button's click rather than to
-//     the form's submit event.
+//   - The first CLICKABLE submit control is clicked. Highest fidelity, and some
+//     sites bind their handler to the button's click rather than to the form's
+//     submit event.
 //   - Otherwise requestSubmit(submitter). It fires the submit event and runs
 //     constraint validation exactly as a click would, needs no visible button,
 //     and — passing the submitter — still contributes that control's name/value
@@ -319,8 +359,18 @@ func (b *Browser) fillField(sel, value string) chromedp.Action {
 //   - Only a browser without requestSubmit falls back to submit(), inside the
 //     same expression. That one BYPASSES the submit event, so a form whose
 //     handler attaches a CSRF token would post without it.
-func (b *Browser) submit(ctx context.Context, formSel, formLabel, formID string) error {
-	clickable, err := b.submitControlClickable(ctx, formID)
+//
+// A navigation is awaited but NOT required. A single-page login handles submit
+// in JavaScript, calls preventDefault(), authenticates over fetch and never
+// navigates at all; demanding a navigation there burned the whole budget and
+// reported exit 5 on a sign-in that had plainly worked. When no navigation
+// arrives, the cookie and form checks in doLogin are left to judge the outcome
+// — which is what they are for.
+func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
+	// Re-mark rather than trusting the earlier pass: filling the fields can run
+	// page script that enables a previously disabled button, which is a common
+	// "enable Sign in once both fields are non-empty" pattern.
+	clickable, err := b.markClickableSubmit(ctx, formID)
 	if err != nil {
 		return fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
 	}
@@ -329,25 +379,34 @@ func (b *Browser) submit(ctx context.Context, formSel, formLabel, formID string)
 	var action chromedp.Action = chromedp.Evaluate(jsRequestSubmit(formID), nil)
 	if clickable {
 		how = "clicking its submit control"
-		// Two selectors, not one: a <button> with no type attribute is a submit
-		// button per the HTML spec, but [type="submit"] matches on the
-		// attribute being literally present.
-		action = chromedp.Click(formSel+` [type="submit"], `+formSel+` button:not([type])`, chromedp.ByQuery)
+		action = chromedp.Click("["+submitMarker+"]", chromedp.ByQuery)
 	}
 
-	// The full remaining budget, not findTimeout: once this dispatches there is
-	// no second chance, so a slow server must be waited out rather than retried.
-	if _, err := chromedp.RunResponse(ctx, action); err != nil {
-		// The submission may well have gone through and merely outlived the
-		// deadline. Say so, instead of implying nothing was sent.
-		return fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
-			"sent; pagevet will not submit them a second time)", ErrLoginFailed, formLabel, how, err)
+	// The navigation wait gets a slice of the budget, not all of it: when it
+	// expires we carry on to the success checks rather than failing, so the
+	// non-navigating case costs one findTimeout instead of the whole sign-in.
+	waitCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
+	defer cancel()
+
+	if _, err := chromedp.RunResponse(waitCtx, action); err != nil {
+		switch {
+		case ctx.Err() != nil:
+			return fmt.Errorf("%w: submitting %s by %s: %w", ErrLoginFailed, formLabel, how, err)
+		case waitCtx.Err() != nil:
+			// No navigation within the window. Either the page authenticated
+			// without one, or nothing happened; doLogin's two checks tell those
+			// apart, and re-sending the credentials is never the answer.
+			return nil
+		default:
+			return fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
+				"sent; pagevet will not submit them a second time)", ErrLoginFailed, formLabel, how, err)
+		}
 	}
 	return nil
 }
 
-// submitControlClickable reports whether the form has a submit control that
-// chromedp could actually click.
+// markClickableSubmit finds the first submit control that could actually be
+// clicked and stamps it, reporting whether one was found.
 //
 // chromedp.Click waits for a node to be VISIBLE, so a control rendered entirely
 // in CSS — `value=""` plus a background image, a common icon-button idiom, and
@@ -356,17 +415,24 @@ func (b *Browser) submit(ctx context.Context, formSel, formLabel, formID string)
 //
 // getClientRects() is the check the spec itself uses for "renders a box": it is
 // empty for display:none, for a detached node, and for a zero-size element.
-func (b *Browser) submitControlClickable(ctx context.Context, formID string) (bool, error) {
+func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool, error) {
 	expr := fmt.Sprintf(`(() => {
   const f = document.getElementById(%s);
   if (!f) return false;
-  const c = f.querySelector('[type="submit"], button:not([type])');
-  if (!c) return false;
-  if (c.disabled) return false;
-  if (c.getClientRects().length === 0) return false;
-  const st = getComputedStyle(c);
-  return st.visibility !== "hidden" && st.display !== "none";
-})()`, jsString(formID))
+  for (const c of f.querySelectorAll(%s)) {
+    c.removeAttribute(%s);
+  }
+  for (const c of f.querySelectorAll(%s)) {
+    if (c.disabled) continue;
+    if (c.getClientRects().length === 0) continue;
+    const st = getComputedStyle(c);
+    if (st.visibility === "hidden" || st.display === "none") continue;
+    c.setAttribute(%s, "");
+    return true;
+  }
+  return false;
+})()`, jsString(formID), jsString(submitControls), jsString(submitMarker),
+		jsString(submitControls), jsString(submitMarker))
 
 	var ok bool
 	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
@@ -383,7 +449,8 @@ func (b *Browser) submitControlClickable(ctx context.Context, formID string) (bo
 // The submitter is passed on purpose: requestSubmit(control) contributes that
 // control's name and value to the submitted data and honors its formaction,
 // where a bare requestSubmit() drops both. Servers that branch on op= — Drupal
-// among them — need it.
+// among them — need it. It prefers the marked control when there is one, so
+// click and no-click paths agree on which button they are speaking for.
 //
 // The submit() fallback lives inside the same expression rather than in a
 // second round trip, so there is still only one dispatch: a browser without
@@ -394,10 +461,45 @@ func jsRequestSubmit(formID string) string {
 	return fmt.Sprintf(`(() => {
   const f = document.getElementById(%s);
   if (!f) throw new Error("form is gone");
-  const c = f.querySelector('[type="submit"], button:not([type])');
+  const c = f.querySelector("[" + %s + "]") || f.querySelector(%s);
   if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
   f.submit(); return "submit";
-})()`, jsString(formID))
+})()`, jsString(formID), jsString(submitMarker), jsString(submitControls))
+}
+
+// checkSubmitDestination validates where the form would POST, before anything
+// is typed into it.
+//
+// The login PAGE passing the address policy says nothing about where its form
+// sends the data. A form on an allowed page can carry action="http://169.254.169.254/…",
+// and a cross-origin form submission needs no CORS permission whatsoever — the
+// browser just sends it. Without this, the configured username and password
+// would be typed and posted to an address the policy exists to keep out.
+//
+// The submitter's formaction overrides the form's action, so the control this
+// run intends to use is consulted too. Both are read as resolved absolute URLs.
+func (b *Browser) checkSubmitDestination(ctx context.Context, spec *login.Spec, formID string) error {
+	expr := fmt.Sprintf(`(() => {
+  const f = document.getElementById(%s);
+  if (!f) return "";
+  const c = f.querySelector("[" + %s + "]") || f.querySelector(%s);
+  if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
+  return f.action || "";
+})()`, jsString(formID), jsString(submitMarker), jsString(submitControls))
+
+	var dest string
+	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
+	defer cancel()
+	if err := chromedp.Run(stepCtx, chromedp.Evaluate(expr, &dest)); err != nil {
+		return fmt.Errorf("%w: reading the submission target of %s: %w", ErrLoginFailed, formID, err)
+	}
+	if dest == "" {
+		// No action attribute and no document URL to inherit is not something a
+		// submittable form has; the committed-page check already covered where
+		// we are.
+		return nil
+	}
+	return b.checkDestination(ctx, "the form on "+b.display(spec.URL), dest)
 }
 
 // cookieDigests returns every cookie in the browser's jar as name -> digest of
@@ -467,25 +569,32 @@ func (b *Browser) checkCommittedPage(ctx context.Context, spec *login.Spec) erro
 		return fmt.Errorf("%w: reading the address of %s after navigation: %w",
 			ErrLoginFailed, b.display(spec.URL), err)
 	}
+	return b.checkDestination(ctx, b.display(spec.URL), href)
+}
 
-	u, err := url.Parse(href)
+// checkDestination applies the run's address policy to one absolute URL.
+//
+// Shared by the two places a credential could otherwise reach an unchecked
+// address: the page that commits after a redirect, and the target the form
+// would POST to. what names the thing being checked, for the error message.
+func (b *Browser) checkDestination(ctx context.Context, what, rawURL string) error {
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("%w: %s left the browser at an unparseable address: %w",
-			ErrLoginFailed, b.display(spec.URL), err)
+		return fmt.Errorf("%w: %s leads to an unparseable address: %w", ErrLoginFailed, what, err)
 	}
 
 	// Same positive allowlist internal/input applies to every crawled URL. A
-	// redirect to a javascript:, data: or file: URL must not be typed into.
+	// javascript:, data: or file: destination must not be typed into.
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("%w: %s redirected to a %q URL; refusing to enter credentials",
-			ErrLoginFailed, b.display(spec.URL), u.Scheme)
+		return fmt.Errorf("%w: %s leads to a %q URL; refusing to enter credentials",
+			ErrLoginFailed, what, u.Scheme)
 	}
 	if b.opts.CheckHost == nil {
 		return nil
 	}
 	if err := b.opts.CheckHost(ctx, u.Hostname()); err != nil {
-		return fmt.Errorf("%w: %s redirected to %s, which fails the address policy: %w. "+
-			"Refusing to enter credentials", ErrLoginFailed, b.display(spec.URL), b.display(href), err)
+		return fmt.Errorf("%w: %s leads to %s, which fails the address policy: %w. "+
+			"Refusing to enter credentials", ErrLoginFailed, what, b.display(rawURL), err)
 	}
 	return nil
 }

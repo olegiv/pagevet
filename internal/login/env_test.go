@@ -464,3 +464,42 @@ func TestParseAcceptsCommentAfterQuotedValue(t *testing.T) {
 		})
 	}
 }
+
+// TestReadFileAcceptsWhitespaceOnlyPassword is a regression for the two halves
+// of this file disagreeing: the required-key check trimmed, while the
+// assignment deliberately preserved password whitespace. An account whose
+// password is spaces could not be used, and the error said the key was missing.
+func TestReadFileAcceptsWhitespaceOnlyPassword(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(validEnv, `USER_ADMIN_PASS="s3cret"`, `USER_ADMIN_PASS="   "`, 1)
+	c, err := ReadFile(writeEnv(t, body), nil)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v; a whitespace-only password is legal", err)
+	}
+	if c.Password != "   " {
+		t.Errorf("Password = %q, want three spaces", c.Password)
+	}
+}
+
+// TestReadFileStillRejectsAnEmptyPassword keeps the fix above from turning into
+// "any password is fine": genuinely absent is still absent.
+func TestReadFileStillRejectsAnEmptyPassword(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(validEnv, `USER_ADMIN_PASS="s3cret"`, `USER_ADMIN_PASS=""`, 1)
+	if _, err := ReadFile(writeEnv(t, body), nil); err == nil {
+		t.Fatal("ReadFile() accepted an empty password, want an error")
+	}
+}
+
+// TestReadFileWhitespaceStillTrimmedForStructuralKeys is the other half: a
+// URL or an identifier padded with spaces is a typo, not a value.
+func TestReadFileWhitespaceStillTrimmedForStructuralKeys(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(validEnv, `LOGIN_FORM_ID="user-login-form"`, `LOGIN_FORM_ID="   "`, 1)
+	if _, err := ReadFile(writeEnv(t, body), nil); err == nil {
+		t.Fatal("ReadFile() accepted a whitespace-only LOGIN_FORM_ID, want an error")
+	}
+}

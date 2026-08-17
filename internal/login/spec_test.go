@@ -510,3 +510,93 @@ func TestHost(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateRejectsControlCharactersInUsername is a log-forgery regression.
+//
+// The username is written verbatim to stderr and into the log-file header, so a
+// newline in it splits one line into two and lets a crafted account value forge
+// a record. It is checked for the same reason the identifiers are, but not the
+// same reason: nothing ever puts the username in a selector.
+func TestValidateRejectsControlCharactersInUsername(t *testing.T) {
+	t.Parallel()
+
+	c := testConfig()
+	c.Username = "admin\n# forged"
+
+	err := c.validate()
+	if err == nil {
+		t.Fatal("validate() accepted a username containing a newline, want an error")
+	}
+	if !errors.Is(err, ErrConfig) {
+		t.Errorf("error = %v, want it to wrap ErrConfig", err)
+	}
+	if !strings.Contains(err.Error(), KeyUsername) {
+		t.Errorf("error = %q, want it to name %s", err, KeyUsername)
+	}
+}
+
+// TestResolveNeverEchoesURLCredentials is a credential-leak regression.
+//
+// A malformed LOGIN_PATH or LOGOUT_PATH is reported before any redaction path
+// exists, and url.Parse embeds the whole URL inside its own *url.Error — so
+// both the value and the wrapped error had to stop being printed raw.
+func TestResolveNeverEchoesURLCredentials(t *testing.T) {
+	t.Parallel()
+
+	const secret = "hunter2-in-the-url"
+
+	for name, raw := range map[string]string{
+		// The bad escape must be in the PATH: url.Parse tolerates one in the
+		// query, so a query-only case would simply parse and prove nothing.
+		"userinfo in a malformed URL": "https://user:" + secret + "@example.test/%zz",
+		"credential in the query":     "https://example.test/%zz/login?token=" + secret,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, key := range []string{"login", "logout"} {
+				c := testConfig()
+				if key == "login" {
+					c.LoginPath = raw
+				} else {
+					c.LogoutPath = raw
+				}
+
+				_, err := c.Resolve("https://example.com/")
+				if err == nil {
+					t.Fatalf("Resolve() accepted %q, want an error", raw)
+				}
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("%s error leaks the credential: %q", key, err)
+				}
+				// Still useful: the host survives so the typo is findable.
+				if !strings.Contains(err.Error(), "example.test") {
+					t.Errorf("%s error = %q, want it to keep the host", key, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSafeURLPreview(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ in, want string }{
+		{"https://example.test/login", `"https://example.test/login"`},
+		{"https://user:pass@example.test/login", `"https://example.test/login"`},
+		{"https://user@example.test/login", `"https://example.test/login"`},
+		{"https://example.test/login?token=abc", `"https://example.test/login?..."`},
+		{"https://user:pass@example.test/a?b=c", `"https://example.test/a?..."`},
+		// An '@' in the path is not userinfo and must survive.
+		{"https://example.test/a@b", `"https://example.test/a@b"`},
+		{"/login", `"/login"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			t.Parallel()
+			if got := safeURLPreview(tt.in); got != tt.want {
+				t.Errorf("safeURLPreview(%q) = %s, want %s", tt.in, got, tt.want)
+			}
+		})
+	}
+}

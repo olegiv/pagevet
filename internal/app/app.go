@@ -146,6 +146,18 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 					page.what, verdict.RedactURL(page.rawURL), hostErr)
 				return ExitUsage
 			}
+			// CheckHost deliberately reports a canceled resolver as "no
+			// opinion" — an unresolvable name is Chrome's story to tell, not
+			// the guard's — so a Ctrl-C during the lookup comes back as nil and
+			// the caller has to notice. Without this, an interrupted run walks
+			// straight into NewChrome, whose launch is rooted in
+			// context.Background and so cannot be interrupted: up to the
+			// browser-start timeout spent starting a browser nobody wants, and
+			// exit 3 if it fails on the way.
+			if ctx.Err() != nil {
+				fmt.Fprintf(stderr, "pagevet: interrupted while checking the %s address\n", page.what)
+				return ExitInterrupted
+			}
 		}
 		loginSpec = &spec
 	}

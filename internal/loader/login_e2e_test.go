@@ -452,6 +452,99 @@ func TestLogin_PassesTheSubmitterWhenItCannotBeClicked(t *testing.T) {
 	}
 }
 
+// TestLogin_SinglePageLoginWithoutNavigation covers a login that never
+// navigates: the handler calls preventDefault(), authenticates over fetch, and
+// swaps the form out. Requiring a navigation burned the whole budget and
+// reported exit 5 on a sign-in that had worked.
+func TestLogin_SinglePageLoginWithoutNavigation(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-spa") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; a non-navigating submission was treated as a failure", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_PicksTheUsableSubmitControl covers a form whose FIRST submit
+// control is hidden and posts op=decoy, with the real button after it.
+// querySelector alone would choose the decoy.
+func TestLogin_PicksTheUsableSubmitControl(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-secondbutton") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the hidden decoy control was probably used", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_FindsFieldAssociatedByFormAttribute covers a password input placed
+// outside the form and associated with form="...". The browser submits it
+// normally; a descendant selector never sees it, and the run failed with a
+// "no field named pass" that pointed at a PASSWORD_NAME which was correct.
+func TestLogin_FindsFieldAssociatedByFormAttribute(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-outside") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the out-of-form password field was not found", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_RefusesFormPostingToBlockedHost is the security test for the
+// submission target.
+//
+// The page itself is allowed; its form posts to the cloud metadata address. A
+// cross-origin form submission needs no CORS permission, so nothing in the
+// browser would stop the credentials leaving — the destination has to be
+// settled before anything is typed.
+func TestLogin_RefusesFormPostingToBlockedHost(t *testing.T) {
+	env := e2e(t)
+
+	const password = "zebra-quartz-lantern"
+
+	o := DefaultOptions()
+	o.Timeout = e2eTimeout
+	o.Settle = 250 * time.Millisecond
+	o.Login = &login.Spec{
+		URL:       env.url("/login-evilaction"),
+		FormID:    testfixtures.LoginFormID,
+		UserField: testfixtures.LoginUserField,
+		PassField: testfixtures.LoginPassField,
+		Username:  testfixtures.LoginUser,
+		Password:  password,
+	}
+	o.CheckHost = func(_ context.Context, host string) error {
+		if host == "169.254.169.254" {
+			return errors.New("link-local address blocked by the address policy")
+		}
+		return nil
+	}
+	br := newBrowser(t, o)
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() filled a form that posts to a blocked address")
+	}
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Errorf("error = %v, want it to wrap ErrLoginFailed", err)
+	}
+	if !strings.Contains(err.Error(), "Refusing to enter credentials") {
+		t.Errorf("error = %q, want it to say the credentials were withheld", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("error message contains the password: %q", err)
+	}
+}
+
 func TestLogin_UnknownFormFails(t *testing.T) {
 	env := e2e(t)
 

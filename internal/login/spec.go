@@ -1,9 +1,11 @@
 package login
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -78,6 +80,13 @@ func (c Config) validate() error {
 		{KeyFormID, c.FormID},
 		{KeyUserField, c.UserField},
 		{KeyPassField, c.PassField},
+		// The username is here for a different reason than the other three. It
+		// is not a selector — it is written verbatim to stderr and into the
+		// log-file header, so a newline in it forges a log line. A value like
+		// "admin\n# forged" is exactly the shape that does it. The password is
+		// NOT checked, because it is never written anywhere and a control
+		// character in one is legal.
+		{KeyUsername, c.Username},
 	} {
 		if f.val == "" {
 			return fmt.Errorf("%w: %s: %s is empty", ErrConfig, display(c.path), f.key)
@@ -140,16 +149,20 @@ func (c Config) Resolve(firstURL string) (Spec, error) {
 func (c Config) resolveOne(key, value, firstURL string) (string, error) {
 	ref, err := url.Parse(value)
 	if err != nil {
-		return "", fmt.Errorf("%w: %s: %s=%q is not a valid URL or path: %w",
-			ErrConfig, display(c.path), key, clip(value), err)
+		// Neither the value nor the error is printed as-is. A URL may carry
+		// userinfo or a credential-like query value, and url.Parse wraps the
+		// whole URL inside its own *url.Error - so quoting either would put
+		// credentials on stderr before any redaction path exists.
+		return "", fmt.Errorf("%w: %s: %s=%s is not a valid URL or path: %s",
+			ErrConfig, display(c.path), key, safeURLPreview(value), parseReason(err))
 	}
 
 	if !ref.IsAbs() {
 		base, err := url.Parse(firstURL)
 		if err != nil {
 			return "", fmt.Errorf("%w: %s is a path, so it resolves against the first URL "+
-				"in the input file, but %q does not parse: %w",
-				ErrConfig, key, clip(firstURL), err)
+				"in the input file, but %s does not parse: %s",
+				ErrConfig, key, safeURLPreview(firstURL), parseReason(err))
 		}
 		// Origin only. ResolveReference against the full first URL would let a
 		// relative path land somewhere that depends on that URL's path, which
@@ -166,8 +179,8 @@ func (c Config) resolveOne(key, value, firstURL string) (string, error) {
 			ErrConfig, display(c.path), key, clip(ref.Scheme+"://"+ref.Host))
 	}
 	if ref.Host == "" {
-		return "", fmt.Errorf("%w: %s: %s=%q has no host",
-			ErrConfig, display(c.path), key, clip(value))
+		return "", fmt.Errorf("%w: %s: %s=%s has no host",
+			ErrConfig, display(c.path), key, safeURLPreview(value))
 	}
 	return ref.String(), nil
 }
@@ -229,4 +242,39 @@ func (s Spec) Describe(redactedURL string) string {
 		redactedURL = s.URL
 	}
 	return fmt.Sprintf("%s at %s (form %s)", s.Username, redactedURL, s.FormID)
+}
+
+// safeURLPreview renders a URL for an error message with the two places
+// credentials hide removed: the userinfo, and the query values.
+//
+// It works on a string that may not parse, which is exactly when it is needed —
+// the redaction in internal/verdict operates on a parsed URL and is unavailable
+// here anyway, since this package imports nothing outside the standard library.
+// Scheme, host and path survive, which is what a user needs to spot the typo.
+func safeURLPreview(raw string) string {
+	s := raw
+	if i := strings.Index(s, "//"); i >= 0 {
+		rest := s[i+2:]
+		// Userinfo ends at the first '@' BEFORE the first '/', so a '@' in the
+		// path is left alone.
+		if at := strings.IndexByte(rest, '@'); at >= 0 {
+			if slash := strings.IndexByte(rest, '/'); slash < 0 || at < slash {
+				s = s[:i+2] + rest[at+1:]
+			}
+		}
+	}
+	if q := strings.IndexByte(s, '?'); q >= 0 {
+		s = s[:q] + "?..."
+	}
+	return strconv.Quote(clip(s))
+}
+
+// parseReason extracts the reason from a *url.Error without its URL field,
+// which holds the whole value the caller is trying not to print.
+func parseReason(err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		return uerr.Err.Error()
+	}
+	return err.Error()
 }

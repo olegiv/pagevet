@@ -78,7 +78,17 @@ func ReadFile(path string, warn func(format string, args ...any)) (Config, error
 
 	var missing []string
 	for _, k := range requiredKeys {
-		if strings.TrimSpace(kv[k]) == "" {
+		// The password is tested RAW. Every other key is a URL or an HTML
+		// identifier, where surrounding whitespace is a typo — but a password
+		// of nothing but spaces is a legal password, and the assignment below
+		// deliberately preserves its whitespace. Trimming here as well would
+		// have the two halves disagree and lock out an account whose password
+		// this program is perfectly able to type.
+		empty := strings.TrimSpace(kv[k]) == ""
+		if k == KeyPassword {
+			empty = kv[k] == ""
+		}
+		if empty {
 			missing = append(missing, k)
 		}
 	}
