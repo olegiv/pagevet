@@ -7,20 +7,21 @@ import (
 	"strings"
 )
 
-// identRE is the allowlist for the three values that reach the browser as part
-// of a CSS selector: the form id and the two field names.
+// controlChars matches the characters that have no business in an HTML id or
+// name attribute and would corrupt any selector or script they were pasted
+// into: C0 controls, DEL, and the Unicode line separators.
 //
-// This is a security control, not tidiness. internal/loader builds selectors
-// like `#FormID input[name="UserField"]`, so a .env carrying
+// This is the ONLY restriction on these three values, and it is a sanity check
+// rather than the security boundary. The boundary is escaping: internal/loader
+// puts them inside quoted CSS attribute selectors and JSON-encoded JavaScript
+// string literals, so `x"] , [name="pass` is neutralized by being escaped, not
+// by being rejected.
 //
-//	LOGIN_FORM_ID=x"] , [name="pass
-//
-// would otherwise break out of the attribute selector and retarget the typing
-// at an element of the file's choosing. A positive allowlist closes that the
-// same way internal/input's scheme allowlist closes URL smuggling, and it costs
-// nothing real: these are HTML identifiers, and every character HTML actually
-// uses for one is here.
-var identRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_:.\-]*$`)
+// An allowlist was tried first and was wrong. Rails and PHP forms routinely use
+// nested parameter names — `user[email]`, `user[password]` — which are entirely
+// valid `name` attributes, and refusing them rejected working configurations
+// before Chrome even started.
+var controlChars = regexp.MustCompile(`[\x00-\x1f\x7f\x{2028}\x{2029}]`)
 
 // Config is a parsed, self-consistent .env. Everything in it is validated
 // except the login URL, which cannot be settled until the URL list is read —
@@ -78,10 +79,13 @@ func (c Config) validate() error {
 		{KeyUserField, c.UserField},
 		{KeyPassField, c.PassField},
 	} {
-		if !identRE.MatchString(f.val) {
+		if f.val == "" {
+			return fmt.Errorf("%w: %s: %s is empty", ErrConfig, display(c.path), f.key)
+		}
+		if controlChars.MatchString(f.val) {
 			return fmt.Errorf(
-				"%w: %s: %s=%q is not a valid HTML identifier "+
-					"(letters, digits and _ : . - only, starting with a letter or _)",
+				"%w: %s: %s=%q contains a control character, which cannot appear in an "+
+					"HTML id or name attribute",
 				ErrConfig, display(c.path), f.key, clip(f.val))
 		}
 	}

@@ -161,6 +161,11 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 	opts.ConsoleWarnings = cfg.ConsoleWarnings
 	opts.RedactURLs = !cfg.LogFullURLs
 	opts.Login = loginSpec
+	// The loader re-runs this against the page that actually commits, because a
+	// login page may redirect somewhere the pre-flight check never saw.
+	opts.CheckHost = func(ctx context.Context, host string) error {
+		return input.CheckHost(ctx, host, cfg.AllowLinkLocal)
+	}
 	if cfg.DebugChrome {
 		opts.ChromeStderr = stderr
 	}
@@ -186,6 +191,13 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 		case errors.Is(loginErr, context.Canceled), ctx.Err() != nil:
 			fmt.Fprintf(stderr, "pagevet: interrupted while signing in\n")
 			return ExitInterrupted
+		case errors.Is(loginErr, loader.ErrBrowserUnavailable):
+			// Chrome died mid-sign-in. That is a TOOL failure, not a credential
+			// one, and the whole reason 3 and 5 are separate codes is so an
+			// alert can tell them apart. Checked before the catch-all below,
+			// which would otherwise claim the login was rejected.
+			fmt.Fprintf(stderr, "pagevet: %v\n", loginErr)
+			return ExitInternal
 		case loginErr != nil:
 			// Crawling on anonymously would fill the logs with redirects and
 			// 403s that look like page failures, so this stops the run. The

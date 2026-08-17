@@ -285,56 +285,76 @@ func TestResolveRejectsUnusableBase(t *testing.T) {
 	}
 }
 
-// TestValidateRejectsSelectorInjection is the security test for this package.
+// TestValidateRejectsControlCharacters covers the only thing this package now
+// refuses in these three values.
 //
-// internal/loader interpolates FormID and the two field names into CSS
-// selectors and, for FormID, into JavaScript. If a .env could carry a quote or
-// a bracket through to there, it could retarget the typing at an element of its
-// own choosing — including sending the password somewhere it does not belong.
-func TestValidateRejectsSelectorInjection(t *testing.T) {
+// The selector-injection defense deliberately lives elsewhere: internal/loader
+// escapes these into quoted CSS strings and JSON-encoded JavaScript literals,
+// and TestCSSString / TestJSString over there are what prove `x"] , [name="pass`
+// is neutralized. Rejecting it here as well would cost real configurations —
+// Rails and PHP forms use `user[email]` — for no additional safety.
+func TestValidateRejectsControlCharacters(t *testing.T) {
 	t.Parallel()
 
-	hostile := []string{
-		`x"] , [name="pass`,
-		`x'] , [name='pass`,
-		`form, script`,
-		`x"><script>fetch(1)</script>`,
-		`x\"`,
-		"x`y",
-		`x)`,
-		"x y",   // a space is a descendant combinator
-		"x#y",   // starts a second id
-		"x.y z", // class then descendant
-		"",
-		"1leading-digit", // a bare digit start is not a valid HTML id anyway
-		"-leading-dash",
+	bad := []string{
 		"x\ny",
-		"x\x00y", // a NUL byte
+		"x\ry",
+		"x\x00y",  // NUL
+		"x\x7fy",  // DEL
+		"x\u2028", // JS line separator
+		"x\u2029",
+		"", // empty
 	}
 
-	for _, bad := range hostile {
-		t.Run(bad, func(t *testing.T) {
+	for _, v := range bad {
+		t.Run(v, func(t *testing.T) {
 			t.Parallel()
 
 			for _, field := range []string{"FormID", "UserField", "PassField"} {
 				c := testConfig()
 				switch field {
 				case "FormID":
-					c.FormID = bad
+					c.FormID = v
 				case "UserField":
-					c.UserField = bad
+					c.UserField = v
 				case "PassField":
-					c.PassField = bad
+					c.PassField = v
 				}
 
 				err := c.validate()
 				if err == nil {
-					t.Errorf("validate() accepted %s = %q, want an error", field, bad)
+					t.Errorf("validate() accepted %s = %q, want an error", field, v)
 					continue
 				}
 				if !errors.Is(err, ErrConfig) {
 					t.Errorf("validate() error = %v, want it to wrap ErrConfig", err)
 				}
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsNestedFieldNames is the regression for the bracketed-name
+// bug: `user[email]` and `user[password]` are ordinary Rails and PHP field
+// names, and an identifier allowlist rejected them before Chrome ever started.
+func TestValidateAcceptsNestedFieldNames(t *testing.T) {
+	t.Parallel()
+
+	for _, pair := range [][2]string{
+		{"user[email]", "user[password]"},
+		{"session[login]", "session[password]"},
+		{"data[User][username]", "data[User][passwd]"},
+		{"form.username", "form.password"},
+		{"login-email", "login-password"},
+		{"q_1", "q_2"},
+	} {
+		t.Run(pair[0], func(t *testing.T) {
+			t.Parallel()
+
+			c := testConfig()
+			c.UserField, c.PassField = pair[0], pair[1]
+			if err := c.validate(); err != nil {
+				t.Errorf("validate() rejected %q / %q: %v", pair[0], pair[1], err)
 			}
 		})
 	}

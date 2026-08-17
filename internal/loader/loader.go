@@ -115,6 +115,19 @@ type Options struct {
 	// field. See verdict.RedactURL.
 	RedactURLs bool
 
+	// CheckHost validates a hostname against the run's address policy. Nil
+	// skips the check.
+	//
+	// It exists because a login page may REDIRECT. app.run validates the
+	// configured LOGIN_PATH host before the browser starts, but the page that
+	// finally commits — and receives the password — can be somewhere else
+	// entirely. Browser.Login re-checks the committed URL through this hook
+	// before it types anything.
+	//
+	// A function rather than a policy struct: the address policy lives in
+	// internal/input, and the loader has no business owning it or importing it.
+	CheckHost func(ctx context.Context, host string) error
+
 	// Login, when non-nil, is the form and account Browser.Login signs in with.
 	// Nil disables authentication entirely and is the default; Login returns an
 	// error rather than silently succeeding if it is called with no spec.

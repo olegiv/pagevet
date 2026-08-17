@@ -2,12 +2,17 @@ package loader
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/storage"
 	"github.com/chromedp/chromedp"
 
@@ -32,7 +37,8 @@ var _ Authenticator = (*Browser)(nil)
 //
 // Success is two independent signals, both required:
 //
-//  1. a cookie exists now whose name did not exist before the submit, and
+//  1. the cookie jar changed — a cookie appeared, or an existing one's value
+//     was replaced — and
 //  2. the login form is gone from the page.
 //
 // Either alone lies in a common case. A site that sets a CSRF or flash-message
@@ -40,6 +46,11 @@ var _ Authenticator = (*Browser)(nil)
 // that renders its login block only for anonymous users can satisfy (2) via a
 // redirect that dropped the session. Requiring both, and reporting which one
 // failed, is what makes the resulting error message actionable.
+//
+// (1) is a value comparison rather than a new-name check on purpose. The
+// PHP/Express shape — the login page hands out an anonymous session cookie and
+// the POST authenticates that same server-side session — never introduces a new
+// name, and demanding one made -login unusable on those sites.
 //
 // Per the Authenticator contract every non-nil error here is run-fatal.
 //
@@ -121,18 +132,24 @@ func (b *Browser) runFind(ctx context.Context, action chromedp.Action) (timedOut
 // doLogin is the sequence itself, kept apart from Login's context plumbing and
 // error triage so that each reads as one thing.
 func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
-	// The form is matched with [id="..."] rather than #id because login.identRE
-	// allows '.' and ':', which are legal in an HTML id and both special in a
-	// CSS selector: #a.b means "id a, class b", not "id a.b". Quoting the value
-	// sidesteps the escaping entirely, and matches how the field selectors
-	// already work.
+	// Selectors are built by ESCAPING, not by trusting the values.
 	//
-	// formLabel is the same thing written the way the user wrote it in .env,
-	// for error messages only. Nothing is ever queried with it.
-	formSel := fmt.Sprintf(`[id=%q]`, spec.FormID)
+	// internal/login deliberately allows anything short of a control character
+	// in these three, because `user[email]` is a perfectly ordinary Rails or PHP
+	// field name. That makes the escaping here the security boundary: a .env
+	// carrying `x"] , [name="pass` must end up as one attribute selector
+	// matching a literal element of that name, never as two selectors.
+	//
+	// [id="..."] rather than #id for the same reason a quoted attribute selector
+	// is used for the fields: an id may legally contain '.' or ':', and #a.b
+	// means "id a, class b", not "id a.b".
+	//
+	// formLabel is the value as the user wrote it in .env, for error messages
+	// only. Nothing is ever queried with it.
+	formSel := fmt.Sprintf("[id=%s]", cssString(spec.FormID))
 	formLabel := "#" + spec.FormID
-	userSel := fmt.Sprintf(`%s [name=%q]`, formSel, spec.UserField)
-	passSel := fmt.Sprintf(`%s [name=%q]`, formSel, spec.PassField)
+	userSel := fmt.Sprintf("%s [name=%s]", formSel, cssString(spec.UserField))
+	passSel := fmt.Sprintf("%s [name=%s]", formSel, cssString(spec.PassField))
 
 	// Sign out first, when LOGOUT_PATH says how.
 	//
@@ -157,7 +174,19 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return fmt.Errorf("%w: opening %s: %w", ErrLoginFailed, b.display(spec.URL), err)
 	}
 
-	before, err := cookieNames(ctx)
+	// Re-check where we actually landed, BEFORE typing a password into it.
+	//
+	// app.run validated the configured LOGIN_PATH host, but Navigate follows
+	// redirects: a login page that 302s elsewhere means the checks were run
+	// against a URL that never received the credentials. A redirect to another
+	// origin is legitimate (an SSO hop), so this does not demand the origin be
+	// unchanged - it demands the destination pass the same checks the
+	// configured one did.
+	if err := b.checkCommittedPage(ctx, spec); err != nil {
+		return err
+	}
+
+	before, err := cookieDigests(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: reading cookies before submit: %w", ErrLoginFailed, err)
 	}
@@ -171,11 +200,8 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 			ErrLoginFailed, formLabel, b.display(spec.URL), findErr)
 	}
 
-	// SendKeys dispatches real key events, so a field with a JS input handler
-	// (a framework-controlled input, a "show password" toggle) sees what a
-	// human would. Nothing here interpolates the password into JavaScript or
-	// into a selector; it travels only as an argument.
-	switch timedOut, findErr := b.runFind(ctx, chromedp.SendKeys(userSel, spec.Username, chromedp.ByQuery)); {
+	// Fill both fields. Errors below name the SELECTOR, never the value.
+	switch timedOut, findErr := b.runFind(ctx, b.fillField(userSel, spec.Username)); {
 	case timedOut:
 		return fmt.Errorf("%w: %s has no field named %q. Check USERNAME_NAME",
 			ErrLoginFailed, formLabel, spec.UserField)
@@ -183,8 +209,7 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return fmt.Errorf("%w: filling the username field %s: %w", ErrLoginFailed, userSel, findErr)
 	}
 
-	// Every error below names the SELECTOR, never the value typed into it.
-	switch timedOut, findErr := b.runFind(ctx, chromedp.SendKeys(passSel, spec.Password, chromedp.ByQuery)); {
+	switch timedOut, findErr := b.runFind(ctx, b.fillField(passSel, spec.Password)); {
 	case timedOut:
 		return fmt.Errorf("%w: %s has no field named %q. Check PASSWORD_NAME",
 			ErrLoginFailed, formLabel, spec.PassField)
@@ -205,11 +230,11 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		_ = chromedp.Run(ctx, chromedp.Sleep(b.opts.Settle))
 	}
 
-	after, err := cookieNames(ctx)
+	after, err := cookieDigests(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: reading cookies after submit: %w", ErrLoginFailed, err)
 	}
-	gained := newNames(before, after)
+	changed := changedCookies(before, after)
 
 	formGone, err := formAbsent(ctx, spec.FormID)
 	if err != nil {
@@ -219,19 +244,56 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// The two failures below are worded to be told apart at a glance, because
 	// they have completely different fixes.
 	switch {
-	case len(gained) == 0 && !formGone:
-		return fmt.Errorf("%w: submitted %s but nothing happened: no new cookie was set and %s "+
-			"is still on the page. The usual cause is wrong credentials",
+	case len(changed) == 0 && !formGone:
+		return fmt.Errorf("%w: submitted %s but nothing happened: no cookie was set or changed, "+
+			"and %s is still on the page. The usual cause is wrong credentials",
 			ErrLoginFailed, b.display(spec.URL), formLabel)
-	case len(gained) == 0:
-		return fmt.Errorf("%w: %s went away after submit, but no new cookie was set, so there is "+
-			"no session to crawl with", ErrLoginFailed, formLabel)
+	case len(changed) == 0:
+		return fmt.Errorf("%w: %s went away after submit, but no cookie was set or changed, so "+
+			"there is no session to crawl with", ErrLoginFailed, formLabel)
 	case !formGone:
-		return fmt.Errorf("%w: a new cookie was set (%s) but %s is still on the page. If this site "+
+		return fmt.Errorf("%w: the cookie %s changed but %s is still on the page. If this site "+
 			"shows its login form to signed-in users too, this check is the one to revisit",
-			ErrLoginFailed, joinNames(gained), formLabel)
+			ErrLoginFailed, joinNames(changed), formLabel)
 	}
 	return nil
+}
+
+// fillField types value into the field at sel, REPLACING whatever is there.
+//
+// SendKeys alone appends: it focuses the field and types, so a server-prefilled
+// username turns "editor" into "guesteditor" and a valid account fails to
+// authenticate. The field therefore has to be emptied first.
+//
+// chromedp.Clear is not the way to do it. For an <input> it calls
+// DOM.setAttributeValue(value, ""), which sets the ATTRIBUTE and dispatches no
+// events at all — so a framework-controlled input keeps its own state and never
+// learns the field changed.
+//
+// Selecting the existing text and typing over it is what a person does, and it
+// produces the same event sequence: Input.dispatchKeyEvent carries a native
+// "selectAll" editing command, which needs no Ctrl-vs-Cmd guess, and SendKeys
+// then replaces the selection with real key events.
+func (b *Browser) fillField(sel, value string) chromedp.Action {
+	return chromedp.Tasks{
+		chromedp.Focus(sel, chromedp.ByQuery),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return input.DispatchKeyEvent(input.KeyRawDown).
+				WithCommands([]string{"selectAll"}).
+				Do(ctx)
+		}),
+		// An empty value would leave the selection sitting there, so clear it
+		// explicitly. SendKeys with "" is a no-op, not a delete.
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			if value != "" {
+				return nil
+			}
+			return input.DispatchKeyEvent(input.KeyRawDown).
+				WithCommands([]string{"deleteBackward"}).
+				Do(ctx)
+		}),
+		chromedp.SendKeys(sel, value, chromedp.ByQuery),
+	}
 }
 
 // submit sends the filled-in form and waits for the resulting navigation.
@@ -305,60 +367,112 @@ func (b *Browser) submit(ctx context.Context, formSel, formLabel, formID string)
 
 // jsSubmitForm builds the expression that submits the form by the named method.
 //
-// The id is interpolated into JavaScript, which is safe only because
-// login.Config rejects anything outside [A-Za-z0-9_:.-] before a Spec exists;
-// see login.identRE. method is a literal from this file, never user input.
+// The id goes through jsString, so any value is a literal. method is a
+// constant from this file and never user input.
 //
 // The expression throws rather than returning false when the method is missing,
 // so a browser too old for requestSubmit falls through to the next attempt
 // instead of reporting a silent success.
 func jsSubmitForm(formID, method string) string {
 	return fmt.Sprintf(
-		`(() => { const f = document.getElementById(%q);`+
+		`(() => { const f = document.getElementById(%s);`+
 			` if (!f) throw new Error("form is gone");`+
 			` if (typeof f.%s !== "function") throw new Error("no %s()");`+
 			` f.%s(); return true; })()`,
-		formID, method, method, method)
+		jsString(formID), method, method, method)
 }
 
-// cookieNames returns the names of every cookie in the browser's jar.
+// cookieDigests returns every cookie in the browser's jar as name -> digest of
+// its value.
 //
 // Storage.getCookies with no browser-context id covers the whole default
 // browser context, which is precisely the jar every crawl tab will read from —
 // so this measures the thing the crawl actually depends on, rather than the
 // login tab's view of it.
 //
-// Only names are kept. Values are session tokens, and this program has no
-// reason to hold one in a variable that some future error path might format.
-func cookieNames(ctx context.Context) ([]string, error) {
-	var names []string
+// Values are DIGESTED rather than kept. A session token has no business sitting
+// in a variable that some future error path might format, and a digest answers
+// the only question asked of it: did this cookie change? SHA-256 truncated to
+// eight bytes is far more than enough to distinguish two values that a server
+// meant to be different.
+func cookieDigests(ctx context.Context) (map[string]string, error) {
+	digests := make(map[string]string)
 	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		cookies, err := storage.GetCookies().Do(ctx)
 		if err != nil {
 			return err
 		}
-		names = make([]string, 0, len(cookies))
+		clear(digests)
 		for _, c := range cookies {
-			names = append(names, c.Name)
+			sum := sha256.Sum256([]byte(c.Value))
+			// Domain and path are part of the identity: two cookies can share
+			// a name across hosts, and collapsing them would hide a change.
+			digests[c.Name+"\x00"+c.Domain+c.Path] = hex.EncodeToString(sum[:8])
 		}
-		slices.Sort(names)
 		return nil
 	}))
-	return names, err
+	return digests, err
 }
 
-// newNames returns the names present in after but not in before.
-func newNames(before, after []string) []string {
-	var gained []string
-	for _, n := range after {
-		if !slices.Contains(before, n) {
-			gained = append(gained, n)
+// changedCookies returns the names of cookies that appeared, or whose value
+// changed, between the two snapshots.
+//
+// A NEW NAME is not required, and that is the point. The obvious flow — the
+// login page hands out an anonymous session cookie, the POST authenticates that
+// same server-side session — leaves the name set identical while the session
+// becomes a completely different thing. Demanding an unseen name rejected those
+// sites outright. Any server that upgrades a session in place still rotates the
+// identifier, because not rotating it is session fixation, so the value change
+// is the signal that actually generalizes.
+func changedCookies(before, after map[string]string) []string {
+	var changed []string
+	for key, digest := range after {
+		if old, existed := before[key]; !existed || old != digest {
+			changed = append(changed, cookieName(key))
 		}
 	}
-	return gained
+	slices.Sort(changed)
+	return slices.Compact(changed)
 }
 
-// joinNames renders gained cookie names for an error message, capped so a site
+// cookieName recovers the display name from a cookieDigests key.
+func cookieName(key string) string {
+	name, _, _ := strings.Cut(key, "\x00")
+	return name
+}
+
+// checkCommittedPage re-runs the address policy against the page that actually
+// committed, which after redirects need not be the one that was configured.
+func (b *Browser) checkCommittedPage(ctx context.Context, spec *login.Spec) error {
+	var href string
+	if err := chromedp.Run(ctx, chromedp.Evaluate("document.location.href", &href)); err != nil {
+		return fmt.Errorf("%w: reading the address of %s after navigation: %w",
+			ErrLoginFailed, b.display(spec.URL), err)
+	}
+
+	u, err := url.Parse(href)
+	if err != nil {
+		return fmt.Errorf("%w: %s left the browser at an unparseable address: %w",
+			ErrLoginFailed, b.display(spec.URL), err)
+	}
+
+	// Same positive allowlist internal/input applies to every crawled URL. A
+	// redirect to a javascript:, data: or file: URL must not be typed into.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%w: %s redirected to a %q URL; refusing to enter credentials",
+			ErrLoginFailed, b.display(spec.URL), u.Scheme)
+	}
+	if b.opts.CheckHost == nil {
+		return nil
+	}
+	if err := b.opts.CheckHost(ctx, u.Hostname()); err != nil {
+		return fmt.Errorf("%w: %s redirected to %s, which fails the address policy: %w. "+
+			"Refusing to enter credentials", ErrLoginFailed, b.display(spec.URL), b.display(href), err)
+	}
+	return nil
+}
+
+// joinNames renders changed cookie names for an error message, capped so a site
 // that sets thirty analytics cookies does not produce a thirty-name error.
 func joinNames(names []string) string {
 	const maxShown = 3
@@ -368,14 +482,54 @@ func joinNames(names []string) string {
 	return strings.Join(names, ", ")
 }
 
-// formAbsent reports whether the login form is gone from the current page.
+// cssString renders s as a quoted CSS string, for use inside an attribute
+// selector such as [name="..."].
 //
-// The id is interpolated into JavaScript, which is safe only because
-// login.Config rejects anything outside [A-Za-z0-9_:.-] before a Spec exists.
-// That allowlist is load-bearing here; see login.identRE.
+// Per the CSS syntax spec a double-quoted string may contain anything except an
+// unescaped double quote, backslash or newline, and a backslash escapes the
+// character after it. Escaping those two characters is therefore sufficient to
+// make any value a single, literal string — which is what stops a field name
+// from closing the selector and starting another. login.Config has already
+// rejected the newlines and other control characters.
+//
+// Go's %q is deliberately NOT used: it emits Go escape syntax (é for a
+// non-ASCII rune), and CSS reads a backslash-escape as hexadecimal, so %q would
+// silently mangle any non-ASCII name.
+func cssString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' || s[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// jsString renders s as a JavaScript string literal.
+//
+// JSON string syntax is a subset of JavaScript's, so encoding/json produces a
+// correct literal for any input, with the one caveat that a JSON string may
+// contain a raw U+2028/U+2029 while older JavaScript could not — which is why
+// login.Config rejects those two before a Spec exists.
+func jsString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		// json.Marshal on a string fails only for invalid UTF-8, which the
+		// .env reader has already rejected. Fall back to something inert
+		// rather than building a broken expression.
+		return `""`
+	}
+	return string(b)
+}
+
+// formAbsent reports whether the login form is gone from the current page.
 func formAbsent(ctx context.Context, formID string) (bool, error) {
 	var absent bool
-	expr := fmt.Sprintf("document.getElementById(%q) === null", formID)
+	expr := fmt.Sprintf("document.getElementById(%s) === null", jsString(formID))
 	if err := chromedp.Run(ctx, chromedp.Evaluate(expr, &absent)); err != nil {
 		return false, err
 	}

@@ -155,7 +155,7 @@ func TestLogin_WrongPasswordFails(t *testing.T) {
 	}
 	// Distinct wording per failing check is the point: the user has to be able
 	// to tell "wrong credentials" from "this site keeps its form".
-	if !strings.Contains(err.Error(), "no new cookie was set") {
+	if !strings.Contains(err.Error(), "no cookie was set or changed") {
 		t.Errorf("error = %q, want it to say no cookie was set", err)
 	}
 	if strings.Contains(err.Error(), wrong) {
@@ -318,6 +318,117 @@ func TestLogin_SubmitsWithoutAClickableButton(t *testing.T) {
 				t.Errorf("/private after Login = %d, want 200", res.Status)
 			}
 		})
+	}
+}
+
+// TestLogin_SessionReusingAnExistingCookieName is the regression for the
+// new-cookie-NAME check.
+//
+// /login-samecookie hands anonymous visitors a session cookie and, on a correct
+// POST, authenticates that same session by rotating its value — the ordinary
+// PHP and Express shape. No name ever appears that was not already there, so a
+// check demanding an unseen name aborted the run on a sign-in that plainly
+// worked.
+func TestLogin_SessionReusingAnExistingCookieName(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-samecookie") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; a rotated value on an existing cookie name was not seen", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_SameCookieNameWrongPasswordStillFails is the control: the same
+// route, wrong credentials, keeps the anonymous value unchanged. If this ever
+// passes, the test above proves nothing — a value comparison that accepted
+// anything would accept this too.
+func TestLogin_SameCookieNameWrongPasswordStillFails(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) {
+		s.URL = env.url("/login-samecookie")
+		s.Password = "definitely-not-the-password"
+	})
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() with a wrong password succeeded, want an error")
+	}
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Errorf("error = %v, want it to wrap ErrLoginFailed", err)
+	}
+}
+
+// TestLogin_ReplacesPrefilledField covers a form whose username arrives already
+// filled in. SendKeys appends, so without clearing first the POST carries
+// "guesteditor" and a valid account fails to authenticate.
+func TestLogin_ReplacesPrefilledField(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-prefilled") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the prefilled username was probably appended to", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_FollowsRedirectToAllowedPage checks the address re-check accepts a
+// redirect whose destination passes the policy — the common case, and the one
+// that must not regress into a refusal.
+func TestLogin_FollowsRedirectToAllowedPage(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-redirect") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() through a redirect error = %v", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_RefusesRedirectToBlockedHost is the security half of the same
+// check: only the CONFIGURED login URL passed the address policy before the
+// browser started, so a redirect must be re-checked before any password is
+// typed into where it landed.
+func TestLogin_RefusesRedirectToBlockedHost(t *testing.T) {
+	env := e2e(t)
+
+	o := DefaultOptions()
+	o.Timeout = e2eTimeout
+	o.Settle = 250 * time.Millisecond
+	o.Login = &login.Spec{
+		URL:       env.url("/login-redirect"),
+		FormID:    testfixtures.LoginFormID,
+		UserField: testfixtures.LoginUserField,
+		PassField: testfixtures.LoginPassField,
+		Username:  testfixtures.LoginUser,
+		Password:  testfixtures.LoginPass,
+	}
+	// Reject exactly the host the redirect lands on. This stands in for the
+	// real policy refusing a link-local or metadata address.
+	o.CheckHost = func(_ context.Context, host string) error {
+		if host == "127.0.0.1" {
+			return errors.New("blocked by the address policy")
+		}
+		return nil
+	}
+	br := newBrowser(t, o)
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() typed credentials into a page the address policy rejects")
+	}
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Errorf("error = %v, want it to wrap ErrLoginFailed", err)
+	}
+	if !strings.Contains(err.Error(), "Refusing to enter credentials") {
+		t.Errorf("error = %q, want it to say the credentials were withheld", err)
 	}
 }
 

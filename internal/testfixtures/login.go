@@ -22,6 +22,11 @@ import (
 //	                    arrive at the login page already signed in
 //	GET  /login-hidden  a form whose submit button is display:none
 //	GET  /login-nobutton a form with no submit control at all
+//	GET  /login-samecookie  hands out an anonymous session on GET and rotates its
+//	                    VALUE on a correct POST, never introducing a new name
+//	GET  /login-prefilled  a form whose username field arrives already filled
+//	GET  /login-redirect   302 to /login, so a test can prove the committed page
+//	                    is re-checked rather than the configured one
 //
 // /login-sticky exists to exercise the half of the success check that is
 // otherwise untestable: a site that keeps rendering its login block to
@@ -84,7 +89,7 @@ func (f *fixture) loginPage(w http.ResponseWriter, r *http.Request) {
 // that must produce a login failure. Sites that set a flash or CSRF cookie on a
 // failed login exist, and that is exactly why pagevet requires the form to be
 // gone as well as a cookie to be new — but this fixture stays honest and sets
-// nothing, so the "no new cookie" branch is the one under test here.
+// nothing, so the "no cookie change" branch is the one under test here.
 func (f *fixture) loginSubmit(w http.ResponseWriter, r *http.Request) {
 	// Bound the body before parsing it. The fixture is only ever posted to by
 	// our own tests, but an unbounded ParseForm is a memory-exhaustion shape
@@ -244,6 +249,75 @@ func setSession(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     LoginCookie,
 		Value:    loginCookieValue,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// anonSession is the pre-login session value handed out by /login-samecookie.
+const anonSession = "anonymous-session"
+
+// loginSameCookie models the PHP/Express flow that a new-cookie-NAME check got
+// wrong: the login page issues a session cookie to anonymous visitors, and a
+// successful POST authenticates that same session by rotating its value.
+//
+// The cookie NAME never changes, so nothing new ever appears in the jar. Only a
+// value comparison sees the sign-in at all.
+func (f *fixture) loginSameCookie(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		if r.PostFormValue(LoginUserField) != LoginUser || r.PostFormValue(LoginPassField) != LoginPass {
+			// Wrong credentials keep the SAME anonymous value, so this route
+			// still fails closed.
+			setNamedSession(w, anonSession)
+			f.html(w, loginForm("/login-samecookie", `<p id="login-error">no</p>`))
+			return
+		}
+		setNamedSession(w, loginCookieValue) // same name, new value
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	setNamedSession(w, anonSession)
+	f.html(w, loginForm("/login-samecookie", ""))
+}
+
+// loginPrefilled serves a form whose username input already carries a value,
+// the way a server that remembers the last user does. SendKeys alone would
+// append to it and submit "guesteditor".
+func (f *fixture) loginPrefilled(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		f.loginSubmit(w, r)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-prefilled">
+  <input type="text" name=%q value="guest">
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField))
+}
+
+// loginRedirect bounces to /login, so a test can assert that the page which
+// actually commits is the one re-checked against the address policy.
+func (f *fixture) loginRedirect(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// setNamedSession issues the session cookie with an explicit value.
+func setNamedSession(w http.ResponseWriter, value string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     LoginCookie,
+		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,

@@ -102,23 +102,29 @@ names the key. Note that some sites require a one-time token on their logout rou
 (Drupal 10 does), in which case a bare `/user/logout` will not work and the key is
 better left unset.
 
-**How it knows the login worked.** Two independent signals, both required: a cookie
-exists that did not exist before the submit, *and* the `LOGIN_FORM_ID` element is gone
-from the page. Either alone lies in a common case — a site that sets a CSRF cookie on
-a *failed* login satisfies the first, and a redirect that dropped the session can
-satisfy the second. If the sign-in fails, pagevet exits **5** and crawls nothing,
+**How it knows the login worked.** Two independent signals, both required: the cookie
+jar changed — a cookie appeared, *or* an existing one's value was replaced — *and* the
+`LOGIN_FORM_ID` element is gone from the page. Either alone lies in a common case — a
+site that sets a CSRF cookie on a *failed* login satisfies the first, and a redirect
+that dropped the session can satisfy the second.
+
+It is a value comparison rather than a hunt for a new cookie *name* because plenty of
+sites never introduce one: PHP and Express commonly hand anonymous visitors a session
+cookie and then authenticate that same session in place. Only the value moves.
+
+If the sign-in fails, pagevet exits **5** and crawls nothing,
 because a wall of 403s that look like page errors is worse than no data at all. The
 message says which of the two checks tripped:
 
 ```
 pagevet: login failed: submitted https://example.com/login but nothing happened:
-no new cookie was set and #user-login-form is still on the page. The usual cause
-is wrong credentials
+no cookie was set or changed, and #user-login-form is still on the page. The
+usual cause is wrong credentials
 ```
 
 > If your site keeps rendering its login block to signed-in users, the second check
 > will fail on a sign-in that actually worked. The error says so explicitly —
-> `a new cookie was set (SSESS…) but #… is still on the page` — so you can tell the
+> `the cookie SSESS… changed but #… is still on the page` — so you can tell the
 > two apart.
 
 **It works because all tabs share one browser.** There is no cookie copying and no
@@ -268,7 +274,7 @@ sign-in was actually attempted and did not take.
 - **Link-local addresses are blocked by default**, including the cloud metadata endpoint `169.254.169.254`
   and its IPv4-mapped IPv6 form. Loopback and RFC1918 remain allowed, because crawling your own staging site
   is the main use case. This is a pre-flight DNS check and is therefore vulnerable to TOCTOU and DNS
-  rebinding — Chrome resolves independently. Treat it as defence in depth, not a boundary.
+  rebinding — Chrome resolves independently. Treat it as defense in depth, not a boundary.
 - **Chrome keeps its OS sandbox.** `pagevet` refuses to run as root, because Chrome would then be launched
   with `--no-sandbox`.
 - **A fresh, empty, auto-deleted temporary profile** is used for every run. Your real cookies, logins and
@@ -280,11 +286,14 @@ sign-in was actually attempted and did not take.
   records the account name, the login URL and the form id, so you can tell which session produced a set of
   results, and nothing else. `.env` is read only when `-login` is passed, and pagevet warns if it is
   group- or world-readable.
-- **`LOGIN_FORM_ID` and the two field names are checked against a positive allowlist** before they are used,
-  because they end up inside a CSS selector. A `.env` cannot smuggle `x"] , [name="pass` through to the
-  browser and retarget where the password gets typed. The login and logout URLs go through the same scheme
-  allowlist and the same link-local check as every URL in your input file — both of them, separately, since
-  `LOGOUT_PATH` may name another origin.
+- **`LOGIN_FORM_ID` and the two field names are escaped, not trusted.** They end up inside a CSS attribute
+  selector and a JavaScript string, so each is emitted as a single quoted literal: a `.env` cannot smuggle
+  `x"] , [name="pass` through and retarget where the password gets typed. Escaping rather than an allowlist,
+  because `user[email]` is an ordinary Rails or PHP field name and rejecting it would break real sites.
+- **The login and logout URLs go through the same scheme allowlist and link-local check as every URL in your
+  input file** — separately, since `LOGOUT_PATH` may name another origin. The page that *actually commits* is
+  re-checked too: a login page is allowed to redirect, so the pre-flight check alone would not cover where
+  the password finally gets typed. A redirect somewhere the policy rejects aborts before anything is entered.
 - **There is no generic `--chrome-flag` passthrough**, on purpose. That flag, not the binary path, is the
   dangerous one: it would let a copy-pasted command line inject `--no-sandbox`, `--disable-web-security` or
   `--user-data-dir=<your real profile>`.

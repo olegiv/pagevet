@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +60,7 @@ func TestLogin_FailureExitsFiveAndCrawlsNothing(t *testing.T) {
 
 	cfg := loginCfg(t, "https://a.test/", "https://b.test/")
 	fb := &fakeBrowser{FakeLoader: fake.New()}
-	fb.SetLoginErr(errors.New("no new cookie was set"))
+	fb.SetLoginErr(errors.New("no cookie was set or changed"))
 
 	var stdout, stderr bytes.Buffer
 	code := run(deadline(t), cfg, factoryFor(fb, nil), &stdout, &stderr)
@@ -72,7 +73,7 @@ func TestLogin_FailureExitsFiveAndCrawlsNothing(t *testing.T) {
 	if n := fb.CallCount(); n != 0 {
 		t.Errorf("loaded %d URLs after a failed login, want 0", n)
 	}
-	if !strings.Contains(stderr.String(), "no new cookie was set") {
+	if !strings.Contains(stderr.String(), "no cookie was set or changed") {
 		t.Errorf("stderr = %q, want it to carry the loader's explanation", stderr.String())
 	}
 }
@@ -100,6 +101,47 @@ func TestLogin_SucceedsBeforeAnyLoad(t *testing.T) {
 	}
 	if n := fb.CallCount(); n != 3 {
 		t.Errorf("loaded %d URLs, want 3", n)
+	}
+}
+
+// TestLogin_BrowserDeathIsInternalNotLoginFailure keeps exit codes 3 and 5
+// meaning different things.
+//
+// If Chrome dies mid-sign-in, Browser.Login reports ErrBrowserUnavailable. A
+// catch-all that mapped every non-nil error to 5 would tell CI the credentials
+// were rejected when the real answer is that the browser is gone — which is the
+// exact confusion the split between the two codes exists to prevent.
+func TestLogin_BrowserDeathIsInternalNotLoginFailure(t *testing.T) {
+	chdirWithEnv(t, envBody)
+
+	cfg := loginCfg(t, "https://a.test/")
+	fb := &fakeBrowser{FakeLoader: fake.New()}
+	fb.SetLoginErr(fmt.Errorf("%w: browser exited during login", loader.ErrBrowserUnavailable))
+
+	var stdout, stderr bytes.Buffer
+	code := run(deadline(t), cfg, factoryFor(fb, nil), &stdout, &stderr)
+
+	if code != ExitInternal {
+		t.Errorf("run() = %d, want %d (ExitInternal); a dead browser is not a credential problem",
+			code, ExitInternal)
+	}
+	if n := fb.CallCount(); n != 0 {
+		t.Errorf("loaded %d URLs after the browser died, want 0", n)
+	}
+}
+
+// TestLogin_GenuineFailureIsStillFive is the companion: an ordinary sign-in
+// failure must not be swept into ExitInternal by the case added above.
+func TestLogin_GenuineFailureIsStillFive(t *testing.T) {
+	chdirWithEnv(t, envBody)
+
+	cfg := loginCfg(t, "https://a.test/")
+	fb := &fakeBrowser{FakeLoader: fake.New()}
+	fb.SetLoginErr(fmt.Errorf("%w: no cookie was set or changed", loader.ErrLoginFailed))
+
+	var stdout, stderr bytes.Buffer
+	if code := run(deadline(t), cfg, factoryFor(fb, nil), &stdout, &stderr); code != ExitLoginFailed {
+		t.Errorf("run() = %d, want %d (ExitLoginFailed)", code, ExitLoginFailed)
 	}
 }
 
@@ -239,10 +281,14 @@ func TestLogin_BadEnvExitsUsage(t *testing.T) {
 			want: "only http and https",
 		},
 		{
-			name: "selector injection in the form id",
+			// A newline cannot appear in an HTML id or name attribute and would
+			// corrupt any selector or script it were pasted into. It is the only
+			// class of value this layer still refuses; selector injection is
+			// handled by escaping in internal/loader, not by rejection here.
+			name: "control character in the form id",
 			body: strings.Replace(envBody, `LOGIN_FORM_ID="user-login-form"`,
-				`LOGIN_FORM_ID="x\"] , [name=\"pass"`, 1),
-			want: "not a valid HTML identifier",
+				`LOGIN_FORM_ID="a\nb"`, 1),
+			want: "control character",
 		},
 		{
 			// LOGOUT_PATH is a URL this program navigates to, so it gets the
@@ -276,6 +322,64 @@ func TestLogin_BadEnvExitsUsage(t *testing.T) {
 				t.Errorf("LoginCalls() = %d after a bad .env, want 0", n)
 			}
 		})
+	}
+}
+
+// TestLogin_NestedFieldNamesAreAccepted is the app-level regression for the
+// bracketed-name bug: `user[email]` is an ordinary Rails and PHP field name,
+// and an identifier allowlist rejected the whole .env before Chrome started.
+// The value must reach the loader intact — escaping happens there, at the point
+// of use, not by mangling the config.
+func TestLogin_NestedFieldNamesAreAccepted(t *testing.T) {
+	body := strings.Replace(envBody, `USERNAME_NAME="name"`, `USERNAME_NAME="user[email]"`, 1)
+	body = strings.Replace(body, `PASSWORD_NAME="pass"`, `PASSWORD_NAME="user[password]"`, 1)
+	chdirWithEnv(t, body)
+
+	cfg := loginCfg(t, "https://example.com/")
+
+	var opts loader.Options
+	fb := &fakeBrowser{FakeLoader: fake.New()}
+
+	var stdout, stderr bytes.Buffer
+	if code := run(deadline(t), cfg, factoryFor(fb, &opts), &stdout, &stderr); code != ExitOK {
+		t.Fatalf("run() = %d, want %d; stderr=%s", code, ExitOK, stderr.String())
+	}
+	if opts.Login == nil {
+		t.Fatal("loader.Options.Login is nil")
+	}
+	if got, want := opts.Login.UserField, "user[email]"; got != want {
+		t.Errorf("UserField = %q, want %q", got, want)
+	}
+	if got, want := opts.Login.PassField, "user[password]"; got != want {
+		t.Errorf("PassField = %q, want %q", got, want)
+	}
+}
+
+// TestLogin_CheckHostReachesTheLoader pins the seam the redirect re-check needs.
+// Without it the loader has no way to apply the run's address policy to a page
+// it was redirected to, and the check silently does nothing.
+func TestLogin_CheckHostReachesTheLoader(t *testing.T) {
+	chdirWithEnv(t, envBody)
+
+	cfg := loginCfg(t, "https://example.com/")
+
+	var opts loader.Options
+	fb := &fakeBrowser{FakeLoader: fake.New()}
+
+	var stdout, stderr bytes.Buffer
+	if code := run(deadline(t), cfg, factoryFor(fb, &opts), &stdout, &stderr); code != ExitOK {
+		t.Fatalf("run() = %d, want %d; stderr=%s", code, ExitOK, stderr.String())
+	}
+	if opts.CheckHost == nil {
+		t.Fatal("loader.Options.CheckHost is nil; a redirected login page would go unchecked")
+	}
+	// And it must be the real policy: link-local is blocked unless the flag says
+	// otherwise, which is what keeps the metadata endpoint out.
+	if err := opts.CheckHost(deadline(t), "169.254.169.254"); err == nil {
+		t.Error("CheckHost accepted the cloud metadata address, want it blocked")
+	}
+	if err := opts.CheckHost(deadline(t), "example.com"); err != nil {
+		t.Errorf("CheckHost rejected an ordinary host: %v", err)
 	}
 }
 
