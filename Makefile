@@ -7,7 +7,7 @@ BIN     := pagevet
 PKG     := github.com/olegiv/pagevet
 LOADER  := $(PKG)/internal/loader
 
-.PHONY: all build clean fmt vet tidy arch test test-e2e lint sec vuln vuln-module check help
+.PHONY: all build clean claude-init fmt vet tidy arch test test-e2e lint sec vuln vuln-module check help
 
 all: build
 
@@ -18,6 +18,15 @@ build:
 ## clean: remove build and coverage artifacts
 clean:
 	rm -f $(BIN) coverage.out coverage.e2e.out cover.html
+
+## claude-init: populate .claude/shared after a clone without --recurse-submodules
+##
+## Nothing in the build depends on .claude, so this is deliberately not part of
+## `check`. It exists because the failure it fixes is silent: a plain git clone
+## leaves the submodule empty and every symlink under .claude dangling, which
+## looks like "the slash commands vanished" rather than like a missing checkout.
+claude-init:
+	git submodule update --init --recursive
 
 ## fmt: fail if anything is unformatted (gofmt exits 0 even when it lists files)
 fmt:
