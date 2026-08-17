@@ -200,6 +200,13 @@ func (r *Reporter) headerText(name string) string {
 			b.WriteString(h.Chrome)
 			b.WriteString("\n")
 		}
+		// Only present on a -login run, so an ordinary run's header is
+		// byte-identical to what it was before -login existed.
+		if h.Login != "" {
+			b.WriteString("# login ")
+			b.WriteString(h.Login)
+			b.WriteString("\n")
+		}
 		// The "# " marker eats the first two columns of the ts field, so the
 		// column head still lands over the data below it.
 		b.WriteString("# ")
@@ -680,10 +687,9 @@ func statusSection(c verdict.Counts) string {
 	var b strings.Builder
 	b.WriteString("http status breakdown\n")
 	for i, p := range pairs {
-		switch {
-		case i%statusBreakdownPerLine == 0:
+		if i%statusBreakdownPerLine == 0 {
 			b.WriteString("  ")
-		default:
+		} else {
 			b.WriteString("    ")
 		}
 		b.WriteString(padLeft(strconv.Itoa(p.Status), 3))

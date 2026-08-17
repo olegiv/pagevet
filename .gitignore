@@ -1,3 +1,6 @@
+#Configuration
+.env
+
 # Build output
 /pagevet
 
@@ -16,5 +19,16 @@ cover.html
 # Security audit results stay local.
 .audit/
 
-# macOS
+# OS specific files
 .DS_Store
+Thumbs.db
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data
+/data/

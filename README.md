@@ -56,7 +56,83 @@ pagevet -headed urls.txt                       # watch it happen, for debugging
 pagevet -out reports/2026-08-14 urls.txt       # somewhere other than ./logs
 pagevet -fail-on-errors urls.txt || alert      # non-zero exit for CI
 pagevet -format json urls.txt                  # JSON Lines logs instead of text
+pagevet -login urls.txt                        # sign in first, see below
 ```
+
+## Logging in
+
+Pages behind a login are the ones most worth checking and the ones a crawler is
+worst at: without a session they all come back as a redirect or a 403, which looks
+like a wall of real failures. `-login` signs in once, before the crawl starts, and
+every URL after that is fetched as that user.
+
+```sh
+cp .env.example .env && chmod 600 .env   # then fill it in
+pagevet -login urls.txt
+```
+
+The flag is the whole command-line surface. Everything else lives in `.env`, read
+from **the directory you run `pagevet` from**:
+
+| Key | What it is |
+| --- | --- |
+| `LOGIN_PATH` | the login page: a path resolved against the first URL in your list, or a full `http(s)://` URL |
+| `LOGOUT_PATH` | *optional* — a sign-out page loaded **before** the login page |
+| `LOGIN_FORM_ID` | `id` of the `<form>` element |
+| `USERNAME_NAME` | `name=` of the username input |
+| `PASSWORD_NAME` | `name=` of the password input |
+| `USER_ADMIN_NAME` | the account to sign in as |
+| `USER_ADMIN_PASS` | its password |
+
+Everything but `LOGOUT_PATH` is required, and a missing or malformed `.env` exits **2**
+before Chrome is ever launched. See `.env.example` for the full annotated file.
+
+**`LOGOUT_PATH` signs out first.** When set, pagevet loads it immediately before the
+login page, so the sign-in always starts from a signed-out state. The run's Chrome
+profile is empty to begin with, so most of the time there is nothing to sign out of —
+but "most of the time" is doing real work in that sentence. Set it when your login page
+behaves differently for a visitor who already has a session; the usual case is a login
+block rendered only to anonymous users, which would otherwise fail with `no visible
+form` on a run that picked up a session somewhere. Omit it and pagevet goes straight to
+the login page, which is what every `.env` written before this key existed does.
+
+It takes the same two forms as `LOGIN_PATH`, gets the same scheme and address checks,
+and may point at a different host. If the page cannot be reached the run exits **5** and
+names the key. Note that some sites require a one-time token on their logout route
+(Drupal 10 does), in which case a bare `/user/logout` will not work and the key is
+better left unset.
+
+**How it knows the login worked.** Two independent signals, both required: a cookie
+exists that did not exist before the submit, *and* the `LOGIN_FORM_ID` element is gone
+from the page. Either alone lies in a common case — a site that sets a CSRF cookie on
+a *failed* login satisfies the first, and a redirect that dropped the session can
+satisfy the second. If the sign-in fails, pagevet exits **5** and crawls nothing,
+because a wall of 403s that look like page errors is worse than no data at all. The
+message says which of the two checks tripped:
+
+```
+pagevet: login failed: submitted https://example.com/login but nothing happened:
+no new cookie was set and #user-login-form is still on the page. The usual cause
+is wrong credentials
+```
+
+> If your site keeps rendering its login block to signed-in users, the second check
+> will fail on a sign-in that actually worked. The error says so explicitly —
+> `a new cookie was set (SSESS…) but #… is still on the page` — so you can tell the
+> two apart.
+
+**It works because all tabs share one browser.** There is no cookie copying and no
+change to the worker pool: every URL is loaded in a tab of the one Chrome the run
+started, so a session established before the pool starts applies to all of them.
+That is the same property listed under "known limitations" below, used on purpose.
+
+Two things worth knowing before you point this at anything:
+
+- **Use the lowest-privilege account that can see the pages you are checking.**
+  pagevet renders every URL in your list with this session, and a page that deletes
+  something on `GET` will be just as deleted.
+- **The session is established once, at the start.** One that expires mid-run is not
+  re-established.
 
 ## What it produces
 
@@ -150,6 +226,7 @@ Run `pagevet -help` for the full list. The ones that change results:
 | `-fail-on-resource` | true | count failed subresources as failures |
 | `-console-warnings` | false | also count `console.warn` |
 | `-headed` | false | visible window, for debugging |
+| `-login` | false | sign in once from `./.env` before crawling ([above](#logging-in)) |
 | `-log-full-urls` | false | disable URL redaction (**unsafe**, see below) |
 | `-fail-on-errors` | false | exit 1 when any URL had an error |
 
@@ -162,14 +239,21 @@ them. At `-concurrency 4`, the default 1.5s adds roughly six minutes to a 1000-U
 ```
 0  the run completed (URLs may still have had errors — read the summary)
 1  only with -fail-on-errors: the run completed and some URLs had errors
-2  usage error, or the input file is missing / unreadable / has no valid URLs
+2  usage error, or the input file is missing / unreadable / has no valid URLs,
+   or .env is missing / malformed when -login is set
 3  the tool itself failed: Chrome would not start, logs could not be written
 4  interrupted by SIGINT/SIGTERM — partial results were written and the summary printed
+5  only with -login: the sign-in failed, so nothing was crawled
 ```
 
 Broken pages are this tool's **output**, not its failure, so a completed run exits 0 by default. Exit 1 is
 opt-in via `-fail-on-errors`. Keeping that separate from exit 3 is what makes the tool usable in CI: a red
 build should mean "your pages are broken", not "the crawler could not find Chrome".
+
+Exit 5 exists for the same reason. "Your credentials are wrong" and "Chrome would not start" want different
+responses from whoever reads the alert, so they get different codes. The split between 2 and 5 follows the
+same rule: a `.env` you fix in an editor is a usage error, like a missing input file, whereas 5 means the
+sign-in was actually attempted and did not take.
 
 ## Security
 
@@ -188,7 +272,19 @@ build should mean "your pages are broken", not "the crawler could not find Chrom
 - **Chrome keeps its OS sandbox.** `pagevet` refuses to run as root, because Chrome would then be launched
   with `--no-sandbox`.
 - **A fresh, empty, auto-deleted temporary profile** is used for every run. Your real cookies, logins and
-  extensions are never exposed to a crawled page.
+  extensions are never exposed to a crawled page. `-login` does not weaken this: it signs in *inside* that
+  throwaway profile, so the only session that ever exists is one this run created, and it is destroyed with
+  the profile when the run ends.
+- **The password is never written anywhere.** Not to a log file, not into an error message, not into the
+  JavaScript pagevet evaluates — it reaches the browser only as an argument to a keystroke. The log header
+  records the account name, the login URL and the form id, so you can tell which session produced a set of
+  results, and nothing else. `.env` is read only when `-login` is passed, and pagevet warns if it is
+  group- or world-readable.
+- **`LOGIN_FORM_ID` and the two field names are checked against a positive allowlist** before they are used,
+  because they end up inside a CSS selector. A `.env` cannot smuggle `x"] , [name="pass` through to the
+  browser and retarget where the password gets typed. The login and logout URLs go through the same scheme
+  allowlist and the same link-local check as every URL in your input file — both of them, separately, since
+  `LOGOUT_PATH` may name another origin.
 - **There is no generic `--chrome-flag` passthrough**, on purpose. That flag, not the binary path, is the
   dangerous one: it would let a copy-pasted command line inject `--no-sandbox`, `--disable-web-security` or
   `--user-data-dir=<your real profile>`.
@@ -205,17 +301,26 @@ Browser-dependent tests are gated by the `PAGEVET_E2E=1` environment variable ra
 Files behind `//go:build e2e` are invisible to `go test ./...`, `go vet` and `golangci-lint`, so they rot
 silently; with an env var they always type-check and only the body skips.
 
-`make arch` enforces the two rules that keep the codebase testable:
+`make arch` enforces the rules that keep the codebase testable:
 
 - `chromedp` is imported by exactly one package, `internal/loader`
 - `internal/verdict` — the classification core — imports nothing outside the standard library
+- `internal/login` — which holds the only password in the program — likewise imports nothing outside the
+  standard library. Same gate, different reason: the cheapest way to keep a credential out of a
+  dependency's logging, telemetry or error formatting is for there to be no dependency at all.
 
-That is why almost everything can be tested without a browser: the pool, the classifier, the reporter and
-the exit-code logic all run against a fake `PageLoader`.
+That is why almost everything can be tested without a browser: the pool, the classifier, the reporter, the
+exit-code logic and the sign-in ordering all run against a fake `PageLoader`.
 
-`.golangci.yml` uses the **v1 config schema** for golangci-lint v1.64.8. Do not migrate it to v2 syntax
-without bumping the binary — v1 silently rejects the v2 keys, which would leave the project effectively
-unlinted.
+`.golangci.yml` uses the **v2 config schema**, for golangci-lint v2.11.4 or newer. Do not hand-edit it back
+to v1 keys (`linters.disable-all`, `linters-settings`, `run.timeout`); v2 rejects them, and while that is at
+least a loud failure, it leaves the project unlinted until somebody notices.
+
+Two things changed meaning when this moved off the v1 schema. `gosimple` and `stylecheck` no longer exist
+separately — both are folded into `staticcheck`, so the enable list is shorter without checking any less.
+And v1's default exclusions, which it applied invisibly, are now spelled out under
+`linters.exclusions.presets`; deleting them makes an otherwise-identical config report dozens of findings
+about unchecked `fmt.Fprintf` and `gosec` in test files.
 
 ## Known limitations
 
@@ -225,7 +330,10 @@ unlinted.
 2. **Subresource failures are not console errors**, by design. If you want a broken asset to fail the page
    as an HTTP error instead, that is a policy change, not a flag.
 3. **Cookies and storage are shared across URLs within a run**, since all tabs share one browser. Logging
-   in on URL 3 affects URL 4. Use separate runs if that matters.
+   in on URL 3 affects URL 4. This is what [`-login`](#logging-in) is built on, but it applies whether or
+   not you use the flag — a page that logs you in, or out, changes the ones after it. Use separate runs if
+   that matters. A session established by `-login` is set up once, before the crawl starts, and is not
+   re-established if it expires mid-run.
 4. **Logs contain the URLs you supplied**, redaction notwithstanding. They are `0600`; treat them as
    sensitive.
 5. **While a run is in flight, any local process running as your user can attach to Chrome's ephemeral

@@ -38,6 +38,11 @@ tidy:
 ## chromedp's own package line and its transitive imports, which match the
 ## pattern for the wrong reason. The trailing-space alternation stops
 ## chromedp/kb and chromedp/device from counting as the driver itself.
+##
+## internal/login is held to the same stdlib-only rule as internal/verdict for a
+## different reason: it holds the only password in the program, and the cheapest
+## way to keep a credential out of a dependency's logging, telemetry or error
+## formatting is for there to be no dependency at all.
 arch:
 	@leak=$$(go list -f '{{.ImportPath}} {{join .Imports " "}} {{join .TestImports " "}}' ./... \
 	    | grep -E ' github\.com/chromedp/chromedp( |$$)' \
@@ -45,14 +50,16 @@ arch:
 	if [ -n "$$leak" ]; then \
 	  echo "FAIL: chromedp is imported outside $(LOADER):"; echo "$$leak"; exit 1; \
 	fi
-	@if go list -f '{{join .Imports "\n"}}' ./internal/verdict \
-	    | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}/'; then \
-	  echo "FAIL: internal/verdict is no longer stdlib-pure"; \
-	  go list -f '{{join .Imports "\n"}}' ./internal/verdict \
-	    | grep -E '^[a-z0-9.-]+\.[a-z]{2,}/'; \
-	  exit 1; \
-	fi
-	@echo "arch: chromedp confined to $(LOADER); internal/verdict is stdlib-pure"
+	@for pkg in ./internal/verdict ./internal/login; do \
+	  if go list -f '{{join .Imports "\n"}}' $$pkg \
+	      | grep -qE '^[a-z0-9.-]+\.[a-z]{2,}/'; then \
+	    echo "FAIL: $$pkg is no longer stdlib-pure"; \
+	    go list -f '{{join .Imports "\n"}}' $$pkg \
+	      | grep -E '^[a-z0-9.-]+\.[a-z]{2,}/'; \
+	    exit 1; \
+	  fi; \
+	done
+	@echo "arch: chromedp confined to $(LOADER); internal/verdict and internal/login are stdlib-pure"
 
 ## test: fast tests, no Chrome required
 test:
@@ -65,8 +72,19 @@ test-e2e:
 	    -coverprofile=coverage.e2e.out -count=1 -timeout=10m -parallel=4
 	@go tool cover -func=coverage.e2e.out | tail -1
 
-## lint: golangci-lint v1 (see the header note in .golangci.yml)
+## lint: golangci-lint v2 (see the header note in .golangci.yml)
+##
+## The version check is not fussiness: a v1 binary rejects every v2 key in
+## .golangci.yml and exits non-zero with a config error, which is easy to read
+## as "lint is broken" and skip past. Saying which binary is wanted turns that
+## into one actionable line.
 lint:
+	@v=$$(golangci-lint version 2>/dev/null | grep -oE 'version v?[0-9]+' | grep -oE '[0-9]+' | head -1); \
+	if [ -z "$$v" ]; then echo "golangci-lint not found; install v2.11.4 or newer"; exit 1; fi; \
+	if [ "$$v" -lt 2 ]; then \
+	  echo "golangci-lint v$$v found, but .golangci.yml uses the v2 schema; install v2.11.4 or newer"; \
+	  exit 1; \
+	fi
 	golangci-lint run ./...
 
 ## sec: standalone gosec; authoritative over the older copy bundled in golangci-lint

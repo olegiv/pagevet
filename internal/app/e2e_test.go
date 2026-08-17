@@ -127,23 +127,31 @@ func buildBinary(ctx context.Context, t *testing.T) string {
 // runBinary runs pagevet to completion and reports its exit code and streams.
 func runBinary(ctx context.Context, t *testing.T, bin string, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
+	return runBinaryIn(ctx, t, "", bin, args...)
+}
+
+// runBinaryIn is runBinary with an explicit working directory, which -login
+// needs: it reads ./.env, so which directory the process starts in is part of
+// what is under test. An empty dir inherits the test's own.
+func runBinaryIn(ctx context.Context, t *testing.T, dir, bin string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
 
 	var out, errOut bytes.Buffer
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = dir
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
 
 	err := cmd.Run()
-	switch {
-	case err == nil:
+	if err == nil {
 		return 0, out.String(), errOut.String()
-	default:
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode(), out.String(), errOut.String()
-		}
-		// Not an exit status: the binary could not be started at all.
-		t.Fatalf("running %s: %v\n--- stderr ---\n%s", bin, err, errOut.String())
-		return -1, "", ""
 	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), out.String(), errOut.String()
+	}
+	// Not an exit status: the binary could not be started at all.
+	t.Fatalf("running %s: %v\n--- stderr ---\n%s", bin, err, errOut.String())
+	return -1, "", ""
 }

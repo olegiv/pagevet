@@ -78,6 +78,17 @@ type Header struct {
 	// "Google Chrome 151.0.7922.138 (headless, JavaScript enabled)". Empty
 	// omits the line entirely rather than printing "chrome unknown".
 	Chrome string
+
+	// Login describes the session these results were gathered under, e.g.
+	// "editor at https://example.com/login (form user-login-form)". Empty - the
+	// default, and the value for every run without -login - omits the line, so
+	// an unauthenticated run's header is unchanged.
+	//
+	// This is provenance that matters six months later: "why did /admin return
+	// 200 in this log and 403 in that one" is answered by one line, and there
+	// is nowhere else the answer is recorded. It never contains a password;
+	// login.Spec.Describe is what produces it.
+	Login string
 }
 
 // Options configures a Reporter.

@@ -88,6 +88,9 @@ func TestParseFlags_Defaults(t *testing.T) {
 		{"DebugChrome", cfg.DebugChrome},
 		{"LogFullURLs", cfg.LogFullURLs},
 		{"AllowLinkLocal", cfg.AllowLinkLocal},
+		// Off by default matters more here than elsewhere: a .env left in the
+		// working directory must never silently authenticate a run.
+		{"Login", cfg.Login},
 		{"FailOnErrors", cfg.FailOnErrors},
 		{"ShowVersion", cfg.ShowVersion},
 	} {
@@ -393,10 +396,46 @@ func TestParseFlags_Help(t *testing.T) {
 		"Exit codes:",
 		"-ok-status",
 		"-fail-on-errors",
+		// -login is useless without knowing which keys .env must carry, and
+		// -help is the only place that list is printed.
+		"-login",
+		"LOGIN_PATH",
+		"LOGIN_FORM_ID",
+		"USERNAME_NAME",
+		"PASSWORD_NAME",
+		"USER_ADMIN_NAME",
+		"USER_ADMIN_PASS",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("usage text is missing %q; got:\n%s", want, got)
 		}
+	}
+}
+
+// TestExitCodesAreDistinct pins the contract CI scripts branch on. Two codes
+// sharing a value would make "the login is broken" and "Chrome is broken"
+// indistinguishable, which is the whole reason they are separate.
+func TestExitCodesAreDistinct(t *testing.T) {
+	t.Parallel()
+
+	codes := map[string]int{
+		"ExitOK":          app.ExitOK,
+		"ExitPageErrors":  app.ExitPageErrors,
+		"ExitUsage":       app.ExitUsage,
+		"ExitInternal":    app.ExitInternal,
+		"ExitInterrupted": app.ExitInterrupted,
+		"ExitLoginFailed": app.ExitLoginFailed,
+	}
+
+	seen := make(map[int]string, len(codes))
+	for name, code := range codes {
+		if other, dup := seen[code]; dup {
+			t.Errorf("%s and %s are both %d", name, other, code)
+		}
+		seen[code] = name
+	}
+	if app.ExitLoginFailed != 5 {
+		t.Errorf("ExitLoginFailed = %d, want 5 (it is documented in -help and the README)", app.ExitLoginFailed)
 	}
 }
 

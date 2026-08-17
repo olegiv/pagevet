@@ -70,6 +70,15 @@ func Handler(logf func(format string, args ...any)) http.Handler {
 	mux.HandleFunc("/alert", f.page(alertHTML))
 	mux.HandleFunc("/download", f.download)
 	mux.HandleFunc("/favicon.ico", f.favicon)
+	// The -login flow; see login.go.
+	mux.HandleFunc("/login", f.loginPage)
+	mux.HandleFunc("/login-sticky", f.loginSticky)
+	mux.HandleFunc("/login-anon", f.loginAnon)
+	mux.HandleFunc("/login-hidden", f.loginHidden)
+	mux.HandleFunc("/login-nobutton", f.loginNoButton)
+	mux.HandleFunc("/logout", f.logout)
+	mux.HandleFunc("/grant", f.grant)
+	mux.HandleFunc("/private", f.private)
 
 	return noStore(mux)
 }

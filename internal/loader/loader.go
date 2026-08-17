@@ -1,6 +1,6 @@
 // Package loader is pagevet's browser layer. It is the only package allowed to
-// import chromedp, and within it only chrome.go does so — `make arch` enforces
-// both rules.
+// import chromedp, and within it only chrome.go and login.go do so — `make
+// arch` enforces the package rule.
 //
 // The PageLoader interface below is the seam that keeps the rest of the program
 // testable: the worker pool, the classifier, the reporter and the exit-code
@@ -13,12 +13,19 @@ import (
 	"io"
 	"time"
 
+	"github.com/olegiv/pagevet/internal/login"
 	"github.com/olegiv/pagevet/internal/verdict"
 )
 
 // ErrBrowserUnavailable means Chrome could not be started, or has died. It is a
 // run-fatal condition, never a per-URL result.
 var ErrBrowserUnavailable = errors.New("browser unavailable")
+
+// ErrLoginFailed means -login was requested and the sign-in did not take. It is
+// deliberately distinct from ErrBrowserUnavailable: Chrome is fine, the
+// credentials or the form spec are not, and the two want different exit codes
+// because they want different fixes.
+var ErrLoginFailed = errors.New("login failed")
 
 // PageLoader loads exactly one URL and reports what the browser observed.
 //
@@ -34,6 +41,20 @@ var ErrBrowserUnavailable = errors.New("browser unavailable")
 // whereas a Result carrying an error outcome is ordinary data.
 type PageLoader interface {
 	Load(ctx context.Context, index int, rawURL string) (verdict.Result, error)
+}
+
+// Authenticator establishes a session before the crawl starts.
+//
+// It is a second interface rather than a method on PageLoader because the
+// contracts differ: PageLoader.Load reports page failures as data, whereas any
+// non-nil error from Login is run-fatal by definition — the caller asked to
+// crawl as somebody, and we are not that somebody.
+//
+// Login must be called at most once, before the first Load. Every tab the
+// loader opens afterwards inherits the session, which is the whole mechanism:
+// see Browser.Login.
+type Authenticator interface {
+	Login(ctx context.Context) error
 }
 
 // Options configures the Chrome-backed PageLoader. The zero value is not
@@ -93,6 +114,14 @@ type Options struct {
 	// RedactURLs strips credentials from URLs before they reach any Result
 	// field. See verdict.RedactURL.
 	RedactURLs bool
+
+	// Login, when non-nil, is the form and account Browser.Login signs in with.
+	// Nil disables authentication entirely and is the default; Login returns an
+	// error rather than silently succeeding if it is called with no spec.
+	//
+	// It is a pointer because "no login configured" and "a login configured
+	// with every field empty" must not be the same value.
+	Login *login.Spec
 }
 
 // DefaultOptions returns the shipped defaults. The caller still has to set

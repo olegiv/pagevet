@@ -15,9 +15,20 @@ import (
 
 	"github.com/olegiv/pagevet/internal/input"
 	"github.com/olegiv/pagevet/internal/loader"
+	"github.com/olegiv/pagevet/internal/login"
 	"github.com/olegiv/pagevet/internal/report"
 	"github.com/olegiv/pagevet/internal/verdict"
 )
+
+// displayURL applies the run's redaction policy to a URL bound for a log file
+// or the terminal. The crawler does this to every URL it reports; the login URL
+// is not an exception just because it came from a config file.
+func displayURL(rawURL string, logFullURLs bool) string {
+	if logFullURLs {
+		return rawURL
+	}
+	return verdict.RedactURL(rawURL)
+}
 
 // Main is the whole program. It returns a process exit code rather than
 // calling os.Exit, so that cmd/pagevet stays a six-line shim and so that
@@ -57,6 +68,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 // except through a subprocess.
 type browser interface {
 	loader.PageLoader
+	loader.Authenticator
 	Describe() string
 	Close()
 }
@@ -69,6 +81,22 @@ type newBrowser func(loader.Options) (browser, error)
 func chromeLoader(o loader.Options) (browser, error) { return loader.NewChrome(o) }
 
 func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr io.Writer) int {
+	// The .env is parsed before anything expensive happens. A typo in it is the
+	// most likely failure of a -login run, and finding out about it after a
+	// 4000-URL address-policy sweep and a Chrome launch would be gratuitous.
+	// Only LOGIN_PATH is left unresolved here; it may need the first URL.
+	var loginCfg login.Config
+	if cfg.Login {
+		c, err := login.ReadFile(login.DefaultPath, func(format string, args ...any) {
+			fmt.Fprintf(stderr, "pagevet: warning: "+format+"\n", args...)
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "pagevet: %v\n", err)
+			return ExitUsage
+		}
+		loginCfg = c
+	}
+
 	// Reading takes the context because it resolves every host to enforce the
 	// address policy; on a large list that is the one phase before crawling
 	// that could otherwise ignore a Ctrl-C for a noticeable while.
@@ -92,6 +120,36 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 		return ExitUsage
 	}
 
+	// LOGIN_PATH may be a bare path, which resolves against the origin of the
+	// first URL in the list. That is why this happens here and not in
+	// login.ReadFile: it is the earliest point at which the answer exists.
+	var loginSpec *login.Spec
+	if cfg.Login {
+		spec, resolveErr := loginCfg.Resolve(parsed.Entries[0].URL)
+		if resolveErr != nil {
+			fmt.Fprintf(stderr, "pagevet: %v\n", resolveErr)
+			return ExitUsage
+		}
+		// The login and logout pages are subject to the same address policy as
+		// every crawled URL. Without this a .env would be a way to reach the
+		// cloud metadata endpoint that -allow-link-local exists to keep out.
+		// LOGOUT_PATH is checked separately because it may name another origin.
+		for _, page := range []struct{ what, rawURL, host string }{
+			{"login page", spec.URL, spec.Host()},
+			{"logout page", spec.LogoutURL, spec.LogoutHost()},
+		} {
+			if page.host == "" {
+				continue // no logout configured
+			}
+			if hostErr := input.CheckHost(ctx, page.host, cfg.AllowLinkLocal); hostErr != nil {
+				fmt.Fprintf(stderr, "pagevet: %s %s: %v\n",
+					page.what, verdict.RedactURL(page.rawURL), hostErr)
+				return ExitUsage
+			}
+		}
+		loginSpec = &spec
+	}
+
 	opts := loader.DefaultOptions()
 	opts.ExecPath = cfg.ChromePath
 	opts.Timeout = cfg.Timeout
@@ -102,6 +160,7 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 	opts.MaxConsolePerPage = cfg.MaxConsole
 	opts.ConsoleWarnings = cfg.ConsoleWarnings
 	opts.RedactURLs = !cfg.LogFullURLs
+	opts.Login = loginSpec
 	if cfg.DebugChrome {
 		opts.ChromeStderr = stderr
 	}
@@ -116,6 +175,30 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 		return ExitInternal
 	}
 	defer br.Close()
+
+	// Sign in before the pool starts, never during it. Every tab the loader
+	// opens from here on shares this browser's cookie jar, which is the entire
+	// mechanism - and it only works if the session exists before the first URL
+	// is dispatched.
+	var loginNote string
+	if loginSpec != nil {
+		switch loginErr := br.Login(ctx); {
+		case errors.Is(loginErr, context.Canceled), ctx.Err() != nil:
+			fmt.Fprintf(stderr, "pagevet: interrupted while signing in\n")
+			return ExitInterrupted
+		case loginErr != nil:
+			// Crawling on anonymously would fill the logs with redirects and
+			// 403s that look like page failures, so this stops the run. The
+			// exit code is its own, because "your credentials are wrong" and
+			// "Chrome would not start" want different responses in CI.
+			fmt.Fprintf(stderr, "pagevet: %v\n", loginErr)
+			return ExitLoginFailed
+		}
+		loginNote = loginSpec.Describe(displayURL(loginSpec.URL, cfg.LogFullURLs))
+		if !cfg.Quiet {
+			fmt.Fprintf(stderr, "pagevet: logged in as %s\n", loginNote)
+		}
+	}
 
 	policy := verdict.Policy{
 		OKStatusMin:    cfg.OKStatusMin,
@@ -137,6 +220,10 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 			Timeout:     cfg.Timeout,
 			Settle:      cfg.Settle,
 			Chrome:      br.Describe(),
+			// Empty unless -login ran, so a run without it produces byte-identical
+			// headers to before this feature existed. Never holds the password:
+			// login.Spec.Describe cannot render one.
+			Login: loginNote,
 		},
 		// -fail-on-errors changes only the reported code, never whether the
 		// run is considered to have completed.
@@ -158,7 +245,9 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 		return ExitInternal
 	}
 
-	var progress io.Writer = io.Discard
+	// io.Discard is itself declared as an io.Writer, so this variable has that
+	// type without the annotation revive objects to.
+	progress := io.Discard
 	if !cfg.Quiet {
 		progress = stderr
 	}

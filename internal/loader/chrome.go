@@ -62,7 +62,11 @@ func NewChrome(o Options) (*Browser, error) {
 	// Start from chromedp's defaults, which already include a fresh temporary
 	// user-data-dir. That temp profile is a security property, not an
 	// implementation detail: it means no cookies, no logins and no extensions
-	// from the user's real profile are ever exposed to a crawled page.
+	// from the user's REAL profile are ever exposed to a crawled page.
+	//
+	// -login does not weaken this. It signs in inside this throwaway profile,
+	// so the session it creates is one this run established and one that dies
+	// with the profile when allocCancel removes the directory. See Login.
 	allocOpts := make([]chromedp.ExecAllocatorOption, 0, len(chromedp.DefaultExecAllocatorOptions)+8)
 	allocOpts = append(allocOpts, chromedp.DefaultExecAllocatorOptions[:]...)
 	allocOpts = append(allocOpts,
