@@ -182,8 +182,14 @@ func parse(body, path string) (map[string]string, error) {
 
 		key, rest, ok := strings.Cut(line, "=")
 		if !ok {
-			return nil, fmt.Errorf("%w: %s:%d: expected KEY=VALUE, got %q",
-				ErrConfig, display(path), lineNo, clip(line))
+			// The line is NOT quoted back, deliberately. A line with no '=' has
+			// no key/value split, so there is no way to tell a stray word from
+			// a mistyped credential: `USER_ADMIN_PASS "s3cret"` would put the
+			// password on stderr and into whatever CI log is watching. The file
+			// path and line number are enough to find it in an editor, and this
+			// program promises the password is never written anywhere.
+			return nil, fmt.Errorf("%w: %s:%d: expected KEY=VALUE (line not shown: it may hold a credential)",
+				ErrConfig, display(path), lineNo)
 		}
 		key = strings.TrimSpace(key)
 		if key == "" {
@@ -210,16 +216,22 @@ func parseValue(s string) (string, error) {
 	}
 	switch s[0] {
 	case '\'':
-		body, ok := closingQuote(s, '\'')
+		body, rest, ok := closingQuote(s, '\'')
 		if !ok {
 			return "", errors.New("unterminated single quote")
+		}
+		if err := checkTrailer(rest); err != nil {
+			return "", err
 		}
 		// Single quotes are literal all the way through, backslashes included.
 		return body, nil
 	case '"':
-		body, ok := closingQuote(s, '"')
+		body, rest, ok := closingQuote(s, '"')
 		if !ok {
 			return "", errors.New("unterminated double quote")
+		}
+		if err := checkTrailer(rest); err != nil {
+			return "", err
 		}
 		return unescape(body), nil
 	}
@@ -233,19 +245,38 @@ func parseValue(s string) (string, error) {
 }
 
 // closingQuote returns the contents between s[0] and the matching closing
-// quote. A backslash escapes the quote character inside a double-quoted value;
-// inside a single-quoted one nothing does, so the first quote closes it.
-func closingQuote(s string, q byte) (string, bool) {
+// quote, plus whatever followed it. A backslash escapes the quote character
+// inside a double-quoted value; inside a single-quoted one nothing does, so the
+// first quote closes it.
+func closingQuote(s string, q byte) (body, rest string, ok bool) {
 	for i := 1; i < len(s); i++ {
 		if s[i] == '\\' && q == '"' {
 			i++ // skip the escaped byte, whatever it is
 			continue
 		}
 		if s[i] == q {
-			return s[1:i], true
+			return s[1:i], s[i+1:], true
 		}
 	}
-	return "", false
+	return "", "", false
+}
+
+// checkTrailer rejects anything but whitespace or a comment after a closing
+// quote.
+//
+// Discarding it silently is the dangerous option: LOGIN_PATH="/login"oops would
+// parse as "/login" and the run would use a URL the file does not visibly
+// contain. The same slip on a credential line is worse. A malformed .env has to
+// produce the documented exit 2, not a quietly different configuration.
+func checkTrailer(rest string) error {
+	rest = strings.TrimSpace(rest)
+	if rest == "" || strings.HasPrefix(rest, "#") {
+		return nil
+	}
+	// The trailing text is NOT quoted back: on a credential line it is part of
+	// the value the user was trying to write.
+	return errors.New("unexpected text after the closing quote; " +
+		"only a # comment may follow (text not shown: it may hold a credential)")
 }
 
 // unescape expands the escapes recognized inside a double-quoted value. An

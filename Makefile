@@ -78,11 +78,22 @@ test-e2e:
 ## .golangci.yml and exits non-zero with a config error, which is easy to read
 ## as "lint is broken" and skip past. Saying which binary is wanted turns that
 ## into one actionable line.
+##
+## It compares all three components, not just the major. Checking only "is it 2"
+## would wave through v2.0 while the message says v2.11.4, and a check that
+## disagrees with its own error text is worse than no check. `sort -t. -k1,1n
+## -k2,2n -k3,3n` orders the two versions numerically per component; if the
+## required one does not sort first, the installed one is older.
 lint:
-	@v=$$(golangci-lint version 2>/dev/null | grep -oE 'version v?[0-9]+' | grep -oE '[0-9]+' | head -1); \
-	if [ -z "$$v" ]; then echo "golangci-lint not found; install v2.11.4 or newer"; exit 1; fi; \
-	if [ "$$v" -lt 2 ]; then \
-	  echo "golangci-lint v$$v found, but .golangci.yml uses the v2 schema; install v2.11.4 or newer"; \
+	@need=2.11.4; \
+	got=$$(golangci-lint version 2>/dev/null \
+	    | grep -oE 'version v?[0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); \
+	if [ -z "$$got" ]; then \
+	  echo "golangci-lint not found (or its version is unreadable); install v$$need or newer"; exit 1; \
+	fi; \
+	if [ "$$(printf '%s\n%s\n' "$$need" "$$got" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" != "$$need" ]; then \
+	  echo "golangci-lint v$$got found, but this project needs v$$need or newer:"; \
+	  echo "  .golangci.yml uses the v2 schema, which v1 rejects outright."; \
 	  exit 1; \
 	fi
 	golangci-lint run ./...

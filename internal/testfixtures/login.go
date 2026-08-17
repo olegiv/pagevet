@@ -27,6 +27,9 @@ import (
 //	GET  /login-prefilled  a form whose username field arrives already filled
 //	GET  /login-redirect   302 to /login, so a test can prove the committed page
 //	                    is re-checked rather than the configured one
+//	GET  /login-op      an UNCLICKABLE submit control carrying name="op", which
+//	                    the handler requires — so the submission must pass the
+//	                    submitter, not just call requestSubmit()
 //
 // /login-sticky exists to exercise the half of the success check that is
 // otherwise untestable: a site that keeps rendering its login block to
@@ -323,4 +326,54 @@ func setNamedSession(w http.ResponseWriter, value string) {
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+// LoginOpField and LoginOpValue are the submit control's name and value on
+// /login-op. Drupal posts exactly this pair as op=.
+const (
+	LoginOpField = "op"
+	LoginOpValue = "Log in"
+)
+
+// loginOp requires the submit control's name/value to reach the server, and
+// makes that control unclickable so the click path cannot supply it.
+//
+// This is the shape a bare requestSubmit() gets wrong: it fires the submit
+// event but contributes no submitter, so op= never arrives and the server
+// rejects credentials that are perfectly correct.
+func (f *fixture) loginOp(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		okCreds := r.PostFormValue(LoginUserField) == LoginUser &&
+			r.PostFormValue(LoginPassField) == LoginPass
+		if !okCreds || r.PostFormValue(LoginOpField) != LoginOpValue {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, loginFormWithOp("<p id=\"login-error\">missing op or bad credentials</p>\n"))
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, loginFormWithOp(""))
+}
+
+// loginFormWithOp renders /login-op's form. The submit control is display:none
+// so it can never be clicked, which is what forces the requestSubmit path.
+func loginFormWithOp(note string) string {
+	return fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+%s<form id=%q method="post" action="/login-op">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" name=%q value=%q style="display:none">
+</form>
+`, note, LoginFormID, LoginUserField, LoginPassField, LoginOpField, LoginOpValue)
 }

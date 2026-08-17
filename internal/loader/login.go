@@ -298,88 +298,106 @@ func (b *Browser) fillField(sel, value string) chromedp.Action {
 
 // submit sends the filled-in form and waits for the resulting navigation.
 //
-// Three ways are tried in order, because no single one works on every real
-// login form:
+// EXACTLY ONE submission is ever dispatched. This used to try three ways in
+// turn and fall through on failure, which had a nasty edge: a login POST slower
+// than one step's slice of the budget looks identical to a submission that
+// never happened, because the old document keeps rendering the form until the
+// response commits. The loop would then submit the credentials a SECOND time —
+// spending a one-time CSRF token, tripping rate limits, or walking an account
+// into a lockout. A slow server must not be able to cause that.
 //
-//  1. Click the submit control. Highest fidelity — some sites bind their
-//     handler to the button's own click rather than to the form's submit
-//     event — but chromedp waits for the node to be VISIBLE, and a submit
-//     input styled entirely in CSS (`value=""` plus a background image, which
-//     is a common way to render an icon button) may never satisfy that.
-//  2. form.requestSubmit(). Fires the submit event and runs constraint
-//     validation, exactly as a real click would, but needs no visible button
-//     and works on a form that has no submit control at all.
-//  3. form.submit(). The blunt fallback. It BYPASSES the submit event, so a
-//     form whose handler attaches a CSRF token would post without it — which
-//     is precisely why it is last rather than first.
+// So the method is chosen up front from the DOM, and then it gets the whole
+// remaining login budget:
 //
-// After a failed attempt the form is re-checked: an attempt that navigated
-// away but whose response chromedp did not match must not be followed by a
-// second attempt against a page that no longer has the form on it.
+//   - A submit control that is actually clickable is clicked. Highest fidelity,
+//     and some sites bind their handler to the button's click rather than to
+//     the form's submit event.
+//   - Otherwise requestSubmit(submitter). It fires the submit event and runs
+//     constraint validation exactly as a click would, needs no visible button,
+//     and — passing the submitter — still contributes that control's name/value
+//     and honors its formaction, which a bare requestSubmit() would drop.
+//   - Only a browser without requestSubmit falls back to submit(), inside the
+//     same expression. That one BYPASSES the submit event, so a form whose
+//     handler attaches a CSRF token would post without it.
 func (b *Browser) submit(ctx context.Context, formSel, formLabel, formID string) error {
-	attempts := []struct {
-		how    string
-		action chromedp.Action
-	}{
-		{
-			"clicking its submit control",
-			// Two selectors, not one: a <button> with no type attribute is a
-			// submit button per the HTML spec, but [type="submit"] matches on
-			// the attribute being literally present.
-			chromedp.Click(formSel+` [type="submit"], `+formSel+` button:not([type])`, chromedp.ByQuery),
-		},
-		{
-			"calling requestSubmit() on it",
-			chromedp.Evaluate(jsSubmitForm(formID, "requestSubmit"), nil),
-		},
-		{
-			"calling submit() on it",
-			chromedp.Evaluate(jsSubmitForm(formID, "submit"), nil),
-		},
+	clickable, err := b.submitControlClickable(ctx, formID)
+	if err != nil {
+		return fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
 	}
 
-	var failures []string
-	for _, a := range attempts {
-		stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
-		_, err := chromedp.RunResponse(stepCtx, a.action)
-		cancel()
-
-		if err == nil {
-			return nil
-		}
-		// Only the caller giving up ends things here; everything else is worth
-		// another way of asking.
-		if ctx.Err() != nil {
-			return fmt.Errorf("%w: submitting %s by %s: %w", ErrLoginFailed, formLabel, a.how, err)
-		}
-		failures = append(failures, fmt.Sprintf("%s: %v", a.how, err))
-
-		// If the form has gone, something did navigate and the checks in
-		// doLogin are a better judge of the outcome than another attempt.
-		if gone, gErr := formAbsent(ctx, formID); gErr == nil && gone {
-			return nil
-		}
+	how := "calling requestSubmit() on it"
+	var action chromedp.Action = chromedp.Evaluate(jsRequestSubmit(formID), nil)
+	if clickable {
+		how = "clicking its submit control"
+		// Two selectors, not one: a <button> with no type attribute is a submit
+		// button per the HTML spec, but [type="submit"] matches on the
+		// attribute being literally present.
+		action = chromedp.Click(formSel+` [type="submit"], `+formSel+` button:not([type])`, chromedp.ByQuery)
 	}
 
-	return fmt.Errorf("%w: could not submit %s. Tried %s",
-		ErrLoginFailed, formLabel, strings.Join(failures, "; "))
+	// The full remaining budget, not findTimeout: once this dispatches there is
+	// no second chance, so a slow server must be waited out rather than retried.
+	if _, err := chromedp.RunResponse(ctx, action); err != nil {
+		// The submission may well have gone through and merely outlived the
+		// deadline. Say so, instead of implying nothing was sent.
+		return fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
+			"sent; pagevet will not submit them a second time)", ErrLoginFailed, formLabel, how, err)
+	}
+	return nil
 }
 
-// jsSubmitForm builds the expression that submits the form by the named method.
+// submitControlClickable reports whether the form has a submit control that
+// chromedp could actually click.
 //
-// The id goes through jsString, so any value is a literal. method is a
-// constant from this file and never user input.
+// chromedp.Click waits for a node to be VISIBLE, so a control rendered entirely
+// in CSS — `value=""` plus a background image, a common icon-button idiom, and
+// exactly what a real Drupal site does — would hang until its deadline. Asking
+// the DOM first turns that into an immediate, correct choice of method.
 //
-// The expression throws rather than returning false when the method is missing,
-// so a browser too old for requestSubmit falls through to the next attempt
-// instead of reporting a silent success.
-func jsSubmitForm(formID, method string) string {
-	return fmt.Sprintf(
-		`(() => { const f = document.getElementById(%s);`+
-			` if (!f) throw new Error("form is gone");`+
-			` if (typeof f.%s !== "function") throw new Error("no %s()");`+
-			` f.%s(); return true; })()`,
-		jsString(formID), method, method, method)
+// getClientRects() is the check the spec itself uses for "renders a box": it is
+// empty for display:none, for a detached node, and for a zero-size element.
+func (b *Browser) submitControlClickable(ctx context.Context, formID string) (bool, error) {
+	expr := fmt.Sprintf(`(() => {
+  const f = document.getElementById(%s);
+  if (!f) return false;
+  const c = f.querySelector('[type="submit"], button:not([type])');
+  if (!c) return false;
+  if (c.disabled) return false;
+  if (c.getClientRects().length === 0) return false;
+  const st = getComputedStyle(c);
+  return st.visibility !== "hidden" && st.display !== "none";
+})()`, jsString(formID))
+
+	var ok bool
+	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
+	defer cancel()
+	if err := chromedp.Run(stepCtx, chromedp.Evaluate(expr, &ok)); err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+// jsRequestSubmit builds the one expression used for every non-click
+// submission.
+//
+// The submitter is passed on purpose: requestSubmit(control) contributes that
+// control's name and value to the submitted data and honors its formaction,
+// where a bare requestSubmit() drops both. Servers that branch on op= — Drupal
+// among them — need it.
+//
+// The submit() fallback lives inside the same expression rather than in a
+// second round trip, so there is still only one dispatch: a browser without
+// requestSubmit takes the other branch without anything having been sent yet.
+//
+// The id goes through jsString, so any value is a literal.
+func jsRequestSubmit(formID string) string {
+	return fmt.Sprintf(`(() => {
+  const f = document.getElementById(%s);
+  if (!f) throw new Error("form is gone");
+  const c = f.querySelector('[type="submit"], button:not([type])');
+  if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
+  f.submit(); return "submit";
+})()`, jsString(formID))
 }
 
 // cookieDigests returns every cookie in the browser's jar as name -> digest of

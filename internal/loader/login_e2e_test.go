@@ -432,6 +432,26 @@ func TestLogin_RefusesRedirectToBlockedHost(t *testing.T) {
 	}
 }
 
+// TestLogin_PassesTheSubmitterWhenItCannotBeClicked covers the case a bare
+// requestSubmit() gets wrong.
+//
+// /login-op's server requires op="Log in" — the submit control's name and value
+// — and that control is display:none, so the click path cannot supply it.
+// requestSubmit() with no submitter fires the submit event but contributes no
+// name/value pair, so op= never arrives and correct credentials are rejected.
+// Only requestSubmit(control) works.
+func TestLogin_PassesTheSubmitterWhenItCannotBeClicked(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-op") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the submitter's name/value probably did not reach the server", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
 func TestLogin_UnknownFormFails(t *testing.T) {
 	env := e2e(t)
 

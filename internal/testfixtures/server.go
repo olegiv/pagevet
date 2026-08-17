@@ -79,6 +79,7 @@ func Handler(logf func(format string, args ...any)) http.Handler {
 	mux.HandleFunc("/login-samecookie", f.loginSameCookie)
 	mux.HandleFunc("/login-prefilled", f.loginPrefilled)
 	mux.HandleFunc("/login-redirect", f.loginRedirect)
+	mux.HandleFunc("/login-op", f.loginOp)
 	mux.HandleFunc("/logout", f.logout)
 	mux.HandleFunc("/grant", f.grant)
 	mux.HandleFunc("/private", f.private)

@@ -143,17 +143,39 @@ func TestJSStringNeutralizesInjection(t *testing.T) {
 	}
 }
 
-// TestJSSubmitFormEscapesID checks the expression actually built for the
-// submit fallbacks, since that is a second place the form id reaches the page.
-func TestJSSubmitFormEscapesID(t *testing.T) {
+// TestJSRequestSubmitEscapesID checks the expression actually built for the
+// submission, since that is a second place the form id reaches the page.
+func TestJSRequestSubmitEscapesID(t *testing.T) {
 	t.Parallel()
 
-	expr := jsSubmitForm(`x"); alert(1); (`, "requestSubmit")
+	expr := jsRequestSubmit(`x"); alert(1); (`)
 	if strings.Contains(expr, `getElementById("x"); alert(1); (")`) {
-		t.Fatalf("jsSubmitForm built an injectable expression: %s", expr)
+		t.Fatalf("jsRequestSubmit built an injectable expression: %s", expr)
 	}
 	if !strings.Contains(expr, `getElementById("x\"); alert(1); (")`) {
-		t.Errorf("jsSubmitForm did not escape the id: %s", expr)
+		t.Errorf("jsRequestSubmit did not escape the id: %s", expr)
+	}
+}
+
+// TestJSRequestSubmitPassesTheSubmitter pins the two properties the expression
+// exists for: the submit control is passed to requestSubmit, so its name/value
+// and formaction survive, and the submit() fallback lives in the SAME
+// expression so a browser without requestSubmit costs no second dispatch.
+func TestJSRequestSubmitPassesTheSubmitter(t *testing.T) {
+	t.Parallel()
+
+	expr := jsRequestSubmit("login-form")
+
+	if !strings.Contains(expr, "f.requestSubmit(c)") {
+		t.Errorf("the submitter is not passed to requestSubmit; name/value and formaction would be dropped:\n%s", expr)
+	}
+	if !strings.Contains(expr, "f.submit()") {
+		t.Errorf("no submit() fallback for a browser without requestSubmit:\n%s", expr)
+	}
+	// One expression, therefore one dispatch: the fallback must not require
+	// going back to the browser a second time.
+	if strings.Count(expr, "document.getElementById") != 1 {
+		t.Errorf("expected a single lookup in one expression:\n%s", expr)
 	}
 }
 

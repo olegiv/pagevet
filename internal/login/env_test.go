@@ -114,6 +114,8 @@ func TestParseRejects(t *testing.T) {
 		want string // substring the message must contain
 	}{
 		{"no equals", "LOGIN_PATH\n", "expected KEY=VALUE"},
+		{"junk after a double-quoted value", `K="v"oops` + "\n", "unexpected text after the closing quote"},
+		{"junk after a single-quoted value", `K='v'oops` + "\n", "unexpected text after the closing quote"},
 		{"empty key", "=value\n", "empty key"},
 		{"unterminated double quote", `K="value` + "\n", "unterminated double quote"},
 		{"unterminated single quote", `K='value` + "\n", "unterminated single quote"},
@@ -382,4 +384,83 @@ func FuzzParse(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestParseNeverEchoesAMalformedLine is a password-leak regression.
+//
+// A line with no '=' has no key/value split, so the parser cannot tell a stray
+// word from a mistyped credential. Quoting it back put a line like
+// `USER_ADMIN_PASS "s3cret"` on stderr and into whatever CI log was watching,
+// breaking the promise that the password is never written anywhere.
+func TestParseNeverEchoesAMalformedLine(t *testing.T) {
+	t.Parallel()
+
+	const password = "correct-horse-battery-staple"
+
+	bodies := map[string]string{
+		"equals mistyped as a space": `USER_ADMIN_PASS "` + password + `"` + "\n",
+		"value pasted on its own":    password + "\n",
+		"yaml habits":                `USER_ADMIN_PASS: "` + password + `"` + "\n",
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := parse(body, "/tmp/.env")
+			if err == nil {
+				t.Fatalf("parse(%q) succeeded, want an error", body)
+			}
+			if strings.Contains(err.Error(), password) {
+				t.Errorf("the error quotes the password back: %q", err)
+			}
+			// It still has to be findable: the path and line number are what
+			// the user needs to open the right line in an editor.
+			if !strings.Contains(err.Error(), ":1:") {
+				t.Errorf("error = %q, want it to name the line number", err)
+			}
+		})
+	}
+}
+
+// TestParseTrailerNeverEchoesTheValue is the same guarantee for the other new
+// rejection: text after a closing quote is part of what the user was writing,
+// which on a credential line is the credential.
+func TestParseTrailerNeverEchoesTheValue(t *testing.T) {
+	t.Parallel()
+
+	const password = "correct-horse-battery-staple"
+
+	_, err := parse(`USER_ADMIN_PASS="x"`+password+"\n", "/tmp/.env")
+	if err == nil {
+		t.Fatal("parse() accepted trailing text after a quoted value, want an error")
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("the error quotes the trailing text back: %q", err)
+	}
+}
+
+// TestParseAcceptsCommentAfterQuotedValue keeps the new trailer check from
+// rejecting the one thing that legitimately follows a closing quote.
+func TestParseAcceptsCommentAfterQuotedValue(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range []string{
+		`K="v" # a note`,
+		`K="v"   `,
+		`K='v' # a note`,
+		`K="v"`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			t.Parallel()
+
+			kv, err := parse(line, ".env")
+			if err != nil {
+				t.Fatalf("parse(%q) error = %v", line, err)
+			}
+			if kv["K"] != "v" {
+				t.Errorf("parse(%q)[K] = %q, want %q", line, kv["K"], "v")
+			}
+		})
+	}
 }
