@@ -201,6 +201,25 @@ make test      # fast tests, no Chrome, ~seconds
 make test-e2e  # includes the tests that drive real Chrome
 ```
 
+### Claude Code support tools
+
+`.claude/shared` is a git submodule of [claude-code-support-tools][ccst], carrying agents,
+slash commands and Go hooks shared across projects. Several files under `.claude/` are
+symlinks into it; the rest are pagevet-specific. See `.claude/README.md` for which is which.
+
+Clone with submodules, or the symlinks dangle:
+
+```sh
+git clone --recurse-submodules https://github.com/olegiv/pagevet.git
+make claude-init                      # fixes an existing clone
+```
+
+Refresh the shared tools with `/update-submodule`, or `git submodule update --remote --merge`.
+That leaves an uncommitted change to the `.claude/shared` gitlink; commit it to keep the
+update. None of this is required to build or test pagevet.
+
+[ccst]: https://github.com/olegiv/claude-code-support-tools
+
 Browser-dependent tests are gated by the `PAGEVET_E2E=1` environment variable rather than a build tag.
 Files behind `//go:build e2e` are invisible to `go test ./...`, `go vet` and `golangci-lint`, so they rot
 silently; with an env var they always type-check and only the body skips.

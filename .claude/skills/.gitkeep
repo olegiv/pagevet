@@ -1,0 +1,5 @@
+Placeholder so this directory exists in a fresh clone.
+
+The shared submodule ships skills only under stacks/drupal/skills and
+stacks/php/skills; the Go stack has none, so there is nothing to symlink.
+Project-specific skills go here as skills/<name>/SKILL.md.
