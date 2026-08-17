@@ -1,6 +1,7 @@
 package loader
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -9,11 +10,16 @@ import (
 //
 // internal/login deliberately accepts almost anything in LOGIN_FORM_ID,
 // USERNAME_NAME and PASSWORD_NAME, because `user[email]` is an ordinary Rails
-// or PHP field name. That makes the escaping here — not a config allowlist —
-// the thing standing between a hostile .env and a password typed into an
-// element of its choosing.
+// or PHP field name. What stands between a hostile .env and a password typed
+// into an element of its choosing is therefore here, and it is two different
+// mechanisms for two different targets:
+//
+//   - CSS selectors are built by ESCAPING, since a selector has to be a string.
+//   - JavaScript is never built at all. Every evaluated expression is a
+//     constant function applied to a JSON argument array, so a value is data
+//     the engine binds rather than program text.
 
-// hostile is the corpus both escapers must neutralize. Each entry is a value
+// hostile is the corpus both mechanisms must neutralize. Each entry is a value
 // that, interpolated raw, would end one string or selector and start another.
 var hostile = []string{
 	`x"] , [name="pass`,
@@ -96,86 +102,83 @@ func TestCSSStringNeutralizesInjection(t *testing.T) {
 	}
 }
 
-func TestJSString(t *testing.T) {
+func TestJSCall(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		in, want string
-	}{
-		{`form`, `"form"`},
-		{`user[email]`, `"user[email]"`},
-		{`a"b`, `"a\"b"`},
-		{`a\b`, `"a\\b"`},
+	got, err := jsCall("function (a, b) { return a + b; }", "x", "y")
+	if err != nil {
+		t.Fatalf("jsCall() error = %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.in, func(t *testing.T) {
-			t.Parallel()
-			if got := jsString(tt.in); got != tt.want {
-				t.Errorf("jsString(%q) = %s, want %s", tt.in, got, tt.want)
-			}
-		})
+	const want = `(function (a, b) { return a + b; }).apply(null, ["x","y"])`
+	if got != want {
+		t.Errorf("jsCall() = %s, want %s", got, want)
 	}
 }
 
-// TestJSStringNeutralizesInjection pins the same property for the JavaScript
-// side, which is where the form id ends up via document.getElementById.
-func TestJSStringNeutralizesInjection(t *testing.T) {
+// TestJSCallNeutralizesInjection is the security property, and it is a stronger
+// one than the escaping it replaced: the JavaScript SOURCE is a constant, so a
+// hostile value is an argument the engine binds rather than text spliced into a
+// program. There is no quoted context for it to close.
+func TestJSCallNeutralizesInjection(t *testing.T) {
 	t.Parallel()
+
+	const fn = "function (id) { return document.getElementById(id); }"
 
 	for _, v := range hostile {
 		t.Run(v, func(t *testing.T) {
 			t.Parallel()
 
-			got := jsString(v)
-			if !strings.HasPrefix(got, `"`) || !strings.HasSuffix(got, `"`) {
-				t.Fatalf("jsString(%q) = %s, want a quoted literal", v, got)
+			got, err := jsCall(fn, v)
+			if err != nil {
+				t.Fatalf("jsCall(%q) error = %v", v, err)
 			}
-			body := got[1 : len(got)-1]
-			for i := 0; i < len(body); i++ {
-				switch body[i] {
-				case '\\':
-					i++
-				case '"':
-					t.Errorf("jsString(%q) = %s has an unescaped quote at %d", v, got, i)
-				}
+			// The function source must survive byte for byte: if a value could
+			// alter it, that is the injection.
+			if !strings.HasPrefix(got, "("+fn+").apply(null, [") {
+				t.Fatalf("jsCall(%q) altered the function source: %s", v, got)
+			}
+			// And the argument array must be valid JSON holding exactly the
+			// value handed in — no more, no fewer.
+			arr := strings.TrimSuffix(strings.TrimPrefix(got, "("+fn+").apply(null, "), ")")
+			var back []string
+			if err := json.Unmarshal([]byte(arr), &back); err != nil {
+				t.Fatalf("argument array is not valid JSON: %s: %v", arr, err)
+			}
+			if len(back) != 1 || back[0] != v {
+				t.Errorf("round trip changed the value: got %q, want %q", back, v)
 			}
 		})
 	}
 }
 
-// TestJSRequestSubmitEscapesID checks the expression actually built for the
-// submission, since that is a second place the form id reaches the page.
-func TestJSRequestSubmitEscapesID(t *testing.T) {
+// TestEvaluatedJSIsConstant is a guard against the old shape creeping back: the
+// four expressions this package evaluates must be constants, carrying no part
+// of any value the user configured.
+func TestEvaluatedJSIsConstant(t *testing.T) {
 	t.Parallel()
 
-	expr := jsRequestSubmit(`x"); alert(1); (`)
-	if strings.Contains(expr, `getElementById("x"); alert(1); (")`) {
-		t.Fatalf("jsRequestSubmit built an injectable expression: %s", expr)
-	}
-	if !strings.Contains(expr, `getElementById("x\"); alert(1); (")`) {
-		t.Errorf("jsRequestSubmit did not escape the id: %s", expr)
-	}
-}
+	const hostileID = `x"); alert(1); (`
 
-// TestJSRequestSubmitPassesTheSubmitter pins the two properties the expression
-// exists for: the submit control is passed to requestSubmit, so its name/value
-// and formaction survive, and the submit() fallback lives in the SAME
-// expression so a browser without requestSubmit costs no second dispatch.
-func TestJSRequestSubmitPassesTheSubmitter(t *testing.T) {
-	t.Parallel()
+	for name, fn := range map[string]string{
+		"jsFormAbsent":          jsFormAbsent,
+		"jsRequestSubmit":       jsRequestSubmit,
+		"jsSubmitDestination":   jsSubmitDestination,
+		"jsMarkClickableSubmit": jsMarkClickableSubmit,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	expr := jsRequestSubmit("login-form")
-
-	if !strings.Contains(expr, "f.requestSubmit(c)") {
-		t.Errorf("the submitter is not passed to requestSubmit; name/value and formaction would be dropped:\n%s", expr)
-	}
-	if !strings.Contains(expr, "f.submit()") {
-		t.Errorf("no submit() fallback for a browser without requestSubmit:\n%s", expr)
-	}
-	// One expression, therefore one dispatch: the fallback must not require
-	// going back to the browser a second time.
-	if strings.Count(expr, "document.getElementById") != 1 {
-		t.Errorf("expected a single lookup in one expression:\n%s", expr)
+			got, err := jsCall(fn, hostileID, submitMarker, submitControls)
+			if err != nil {
+				t.Fatalf("jsCall(%s) error = %v", name, err)
+			}
+			if !strings.Contains(got, fn) {
+				t.Errorf("%s: the function source did not survive interpolation", name)
+			}
+			if strings.Contains(got, `alert(1); (")`) {
+				t.Errorf("%s: the hostile id escaped its argument: %s", name, got)
+			}
+		})
 	}
 }
 

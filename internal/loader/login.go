@@ -375,8 +375,13 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
 		return fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
 	}
 
+	submitExpr, err := jsCall(jsRequestSubmit, formID, submitMarker, submitControls)
+	if err != nil {
+		return err
+	}
+
 	how := "calling requestSubmit() on it"
-	var action chromedp.Action = chromedp.Evaluate(jsRequestSubmit(formID), nil)
+	var action chromedp.Action = chromedp.Evaluate(submitExpr, nil)
 	if clickable {
 		how = "clicking its submit control"
 		action = chromedp.Click("["+submitMarker+"]", chromedp.ByQuery)
@@ -416,23 +421,10 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
 // getClientRects() is the check the spec itself uses for "renders a box": it is
 // empty for display:none, for a detached node, and for a zero-size element.
 func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool, error) {
-	expr := fmt.Sprintf(`(() => {
-  const f = document.getElementById(%s);
-  if (!f) return false;
-  for (const c of f.querySelectorAll(%s)) {
-    c.removeAttribute(%s);
-  }
-  for (const c of f.querySelectorAll(%s)) {
-    if (c.disabled) continue;
-    if (c.getClientRects().length === 0) continue;
-    const st = getComputedStyle(c);
-    if (st.visibility === "hidden" || st.display === "none") continue;
-    c.setAttribute(%s, "");
-    return true;
-  }
-  return false;
-})()`, jsString(formID), jsString(submitControls), jsString(submitMarker),
-		jsString(submitControls), jsString(submitMarker))
+	expr, err := jsCall(jsMarkClickableSubmit, formID, submitMarker, submitControls)
+	if err != nil {
+		return false, err
+	}
 
 	var ok bool
 	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
@@ -442,6 +434,25 @@ func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool,
 	}
 	return ok, nil
 }
+
+// jsMarkClickableSubmit stamps the first clickable submit control and reports
+// whether it found one. getClientRects() is the check the spec itself uses for
+// "renders a box": empty for display:none, for a detached node, and for a
+// zero-size element.
+const jsMarkClickableSubmit = `function (formID, marker, controls) {
+  const f = document.getElementById(formID);
+  if (!f) return false;
+  for (const c of f.querySelectorAll(controls)) { c.removeAttribute(marker); }
+  for (const c of f.querySelectorAll(controls)) {
+    if (c.disabled) continue;
+    if (c.getClientRects().length === 0) continue;
+    const st = getComputedStyle(c);
+    if (st.visibility === "hidden" || st.display === "none") continue;
+    c.setAttribute(marker, "");
+    return true;
+  }
+  return false;
+}`
 
 // jsRequestSubmit builds the one expression used for every non-click
 // submission.
@@ -457,15 +468,13 @@ func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool,
 // requestSubmit takes the other branch without anything having been sent yet.
 //
 // The id goes through jsString, so any value is a literal.
-func jsRequestSubmit(formID string) string {
-	return fmt.Sprintf(`(() => {
-  const f = document.getElementById(%s);
+const jsRequestSubmit = `function (formID, marker, controls) {
+  const f = document.getElementById(formID);
   if (!f) throw new Error("form is gone");
-  const c = f.querySelector("[" + %s + "]") || f.querySelector(%s);
+  const c = f.querySelector("[" + marker + "]") || f.querySelector(controls);
   if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
   f.submit(); return "submit";
-})()`, jsString(formID), jsString(submitMarker), jsString(submitControls))
-}
+}`
 
 // checkSubmitDestination validates where the form would POST, before anything
 // is typed into it.
@@ -479,13 +488,10 @@ func jsRequestSubmit(formID string) string {
 // The submitter's formaction overrides the form's action, so the control this
 // run intends to use is consulted too. Both are read as resolved absolute URLs.
 func (b *Browser) checkSubmitDestination(ctx context.Context, spec *login.Spec, formID string) error {
-	expr := fmt.Sprintf(`(() => {
-  const f = document.getElementById(%s);
-  if (!f) return "";
-  const c = f.querySelector("[" + %s + "]") || f.querySelector(%s);
-  if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
-  return f.action || "";
-})()`, jsString(formID), jsString(submitMarker), jsString(submitControls))
+	expr, err := jsCall(jsSubmitDestination, formID, submitMarker, submitControls)
+	if err != nil {
+		return err
+	}
 
 	var dest string
 	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
@@ -636,27 +642,54 @@ func cssString(s string) string {
 	return b.String()
 }
 
-// jsString renders s as a JavaScript string literal.
+// jsCall renders a call of a CONSTANT JavaScript function with its arguments
+// supplied as data.
 //
-// JSON string syntax is a subset of JavaScript's, so encoding/json produces a
-// correct literal for any input, with the one caveat that a JSON string may
-// contain a raw U+2028/U+2029 while older JavaScript could not — which is why
-// login.Config rejects those two before a Spec exists.
-func jsString(s string) string {
-	b, err := json.Marshal(s)
+// Nothing is interpolated into the JavaScript source. Every expression this
+// package evaluates is a compile-time constant applied to a JSON array, so a
+// form id or field name is an argument the engine binds — never text spliced
+// into a program, and never inside a quoted context it could close.
+//
+// The previous approach escaped each value and interpolated it, which was
+// correct but had to be re-proved at every call site, and read as string-built
+// code to anything auditing it (CodeQL's go/unsafe-quoting among them). This
+// shape removes the question instead of answering it repeatedly.
+//
+// JSON is a subset of JavaScript expression syntax, so the marshaled array is
+// itself a valid JS array literal; Function.prototype.apply spreads it.
+func jsCall(fn string, args ...string) (string, error) {
+	enc, err := json.Marshal(args)
 	if err != nil {
-		// json.Marshal on a string fails only for invalid UTF-8, which the
-		// .env reader has already rejected. Fall back to something inert
-		// rather than building a broken expression.
-		return `""`
+		// Only invalid UTF-8 can fail here, and the .env reader rejects that
+		// before a Spec exists.
+		return "", fmt.Errorf("encoding javascript arguments: %w", err)
 	}
-	return string(b)
+	return "(" + fn + ").apply(null, " + string(enc) + ")", nil
 }
+
+// jsFormAbsent reports whether the login form has gone from the page.
+const jsFormAbsent = `function (formID) {
+  return document.getElementById(formID) === null;
+}`
+
+// jsSubmitDestination returns the URL the form would POST to: the submitter's
+// formaction when it has one, otherwise the form's action. Both are read as
+// resolved absolute URLs.
+const jsSubmitDestination = `function (formID, marker, controls) {
+  const f = document.getElementById(formID);
+  if (!f) return "";
+  const c = f.querySelector("[" + marker + "]") || f.querySelector(controls);
+  if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
+  return f.action || "";
+}`
 
 // formAbsent reports whether the login form is gone from the current page.
 func formAbsent(ctx context.Context, formID string) (bool, error) {
+	expr, err := jsCall(jsFormAbsent, formID)
+	if err != nil {
+		return false, err
+	}
 	var absent bool
-	expr := fmt.Sprintf("document.getElementById(%s) === null", jsString(formID))
 	if err := chromedp.Run(ctx, chromedp.Evaluate(expr, &absent)); err != nil {
 		return false, err
 	}
