@@ -290,14 +290,14 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// they have completely different fixes.
 	switch {
 	case len(changed) == 0 && !formGone:
-		return fmt.Errorf("%w: submitted %s but nothing happened: no cookie was set or changed, "+
+		return fmt.Errorf("%w: submitted %s but nothing happened: no cookie or stored session changed, "+
 			"and %s is still on the page. The usual cause is wrong credentials",
 			ErrLoginFailed, b.display(spec.URL), formLabel)
 	case len(changed) == 0:
-		return fmt.Errorf("%w: %s went away after submit, but no cookie was set or changed, so "+
+		return fmt.Errorf("%w: %s went away after submit, but no cookie or stored session changed, so "+
 			"there is no session to crawl with", ErrLoginFailed, formLabel)
 	case !formGone:
-		return fmt.Errorf("%w: the cookie %s changed but %s is still on the page. If this site "+
+		return fmt.Errorf("%w: the session state changed (%s) but %s is still on the page. If this site "+
 			"shows its login form to signed-in users too, this check is the one to revisit",
 			ErrLoginFailed, joinNames(changed), formLabel)
 	}

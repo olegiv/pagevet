@@ -102,15 +102,26 @@ names the key. Note that some sites require a one-time token on their logout rou
 (Drupal 10 does), in which case a bare `/user/logout` will not work and the key is
 better left unset.
 
-**How it knows the login worked.** Two independent signals, both required: the cookie
-jar changed — a cookie appeared, *or* an existing one's value was replaced — *and* the
-`LOGIN_FORM_ID` element is gone from the page. Either alone lies in a common case — a
-site that sets a CSRF cookie on a *failed* login satisfies the first, and a redirect
-that dropped the session can satisfy the second.
+**How it knows the login worked.** Two independent signals, both required: the session
+state changed, *and* the `LOGIN_FORM_ID` element is gone from the page. Either alone
+lies in a common case — a site that sets a CSRF cookie on a *failed* login satisfies
+the first, and a redirect that dropped the session can satisfy the second.
 
-It is a value comparison rather than a hunt for a new cookie *name* because plenty of
-sites never introduce one: PHP and Express commonly hand anonymous visitors a session
-cookie and then authenticate that same session in place. Only the value moves.
+"Session state" means anything a later tab can actually reuse: the cookie jar, and the
+page's `localStorage`. Three things follow from that, each of which was a real site
+before it was a rule.
+
+- It compares **values**, not just names. PHP and Express commonly hand anonymous
+  visitors a session cookie and then authenticate that same session in place; nothing
+  new appears, only the value moves.
+- It counts **`localStorage`**, because a token-backed SPA may set no cookie at all and
+  still be genuinely signed in for every tab on that origin.
+- It does **not** count `sessionStorage`, which belongs to the tab that wrote it. The
+  login tab is closed as soon as the sign-in finishes, so a token kept only there is a
+  session the crawl would never have.
+
+Storage is compared only while the origin stays put, since it is scoped per origin and
+comparing one origin's storage against another's would call every key new.
 
 If the sign-in fails, pagevet exits **5** and crawls nothing,
 because a wall of 403s that look like page errors is worse than no data at all. The
@@ -118,13 +129,13 @@ message says which of the two checks tripped:
 
 ```
 pagevet: login failed: submitted https://example.com/login but nothing happened:
-no cookie was set or changed, and #user-login-form is still on the page. The
+no cookie or stored session changed, and #user-login-form is still on the page.
 usual cause is wrong credentials
 ```
 
 > If your site keeps rendering its login block to signed-in users, the second check
 > will fail on a sign-in that actually worked. The error says so explicitly —
-> `the cookie SSESS… changed but #… is still on the page` — so you can tell the
+> `the session state changed (SSESS…) but #… is still on the page` — so you can tell the
 > two apart.
 
 **It works because all tabs share one browser.** There is no cookie copying and no
@@ -286,10 +297,15 @@ sign-in was actually attempted and did not take.
   records the account name, the login URL and the form id, so you can tell which session produced a set of
   results, and nothing else. `.env` is read only when `-login` is passed, and pagevet warns if it is
   group- or world-readable.
-- **`LOGIN_FORM_ID` and the two field names are escaped, not trusted.** They end up inside a CSS attribute
-  selector and a JavaScript string, so each is emitted as a single quoted literal: a `.env` cannot smuggle
-  `x"] , [name="pass` through and retarget where the password gets typed. Escaping rather than an allowlist,
-  because `user[email]` is an ordinary Rails or PHP field name and rejecting it would break real sites.
+- **`LOGIN_FORM_ID` and the two field names never become code.** Every expression pagevet evaluates is a
+  constant JavaScript function applied to a JSON argument array, so a configured value is data the engine
+  binds rather than program text — there is no quoted context for `x"] , [name="pass` to close. CSS
+  selectors, which must be strings, are escaped instead and tested against the same hostile corpus. Both,
+  rather than an allowlist, because `user[email]` is an ordinary Rails or PHP field name.
+- **A credential is never typed into a control that could turn it into a file upload.** `chromedp.SendKeys`
+  special-cases `<input type="file">` and treats the value as a local path, so a path-shaped password would
+  upload that file to the site. pagevet inserts text through a path that has no such branch, and separately
+  refuses any control that is not text-capable.
 - **The login and logout URLs go through the same scheme allowlist and link-local check as every URL in your
   input file** — separately, since `LOGOUT_PATH` may name another origin. The page that *actually commits* is
   re-checked too: a login page is allowed to redirect, so the pre-flight check alone would not cover where

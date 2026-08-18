@@ -155,7 +155,7 @@ func TestLogin_WrongPasswordFails(t *testing.T) {
 	}
 	// Distinct wording per failing check is the point: the user has to be able
 	// to tell "wrong credentials" from "this site keeps its form".
-	if !strings.Contains(err.Error(), "no cookie was set or changed") {
+	if !strings.Contains(err.Error(), "no cookie or stored session changed") {
 		t.Errorf("error = %q, want it to say no cookie was set", err)
 	}
 	if strings.Contains(err.Error(), wrong) {

@@ -60,7 +60,7 @@ func TestLogin_FailureExitsFiveAndCrawlsNothing(t *testing.T) {
 
 	cfg := loginCfg(t, "https://a.test/", "https://b.test/")
 	fb := &fakeBrowser{FakeLoader: fake.New()}
-	fb.SetLoginErr(errors.New("no cookie was set or changed"))
+	fb.SetLoginErr(errors.New("no cookie or stored session changed"))
 
 	var stdout, stderr bytes.Buffer
 	code := run(deadline(t), cfg, factoryFor(fb, nil), &stdout, &stderr)
@@ -73,7 +73,7 @@ func TestLogin_FailureExitsFiveAndCrawlsNothing(t *testing.T) {
 	if n := fb.CallCount(); n != 0 {
 		t.Errorf("loaded %d URLs after a failed login, want 0", n)
 	}
-	if !strings.Contains(stderr.String(), "no cookie was set or changed") {
+	if !strings.Contains(stderr.String(), "no cookie or stored session changed") {
 		t.Errorf("stderr = %q, want it to carry the loader's explanation", stderr.String())
 	}
 }
@@ -137,7 +137,7 @@ func TestLogin_GenuineFailureIsStillFive(t *testing.T) {
 
 	cfg := loginCfg(t, "https://a.test/")
 	fb := &fakeBrowser{FakeLoader: fake.New()}
-	fb.SetLoginErr(fmt.Errorf("%w: no cookie was set or changed", loader.ErrLoginFailed))
+	fb.SetLoginErr(fmt.Errorf("%w: no cookie or stored session changed", loader.ErrLoginFailed))
 
 	var stdout, stderr bytes.Buffer
 	if code := run(deadline(t), cfg, factoryFor(fb, nil), &stdout, &stderr); code != ExitLoginFailed {
