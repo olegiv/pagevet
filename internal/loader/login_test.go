@@ -453,3 +453,45 @@ func TestDisplayTargetDropsTheQuery(t *testing.T) {
 		})
 	}
 }
+
+// TestSubmitPredicateIsSharedNotCopied guards the mechanism behind three
+// separate review findings.
+//
+// The rule for "which controls submit this form" was written out in four
+// expressions. Each time review corrected it — image buttons, externally
+// associated controls, <button type=""> — the correction landed in some copies
+// and not others, and the next round found the ones that were missed. There is
+// now one definition; this fails if a future edit inlines a variant.
+func TestSubmitPredicateIsSharedNotCopied(t *testing.T) {
+	t.Parallel()
+
+	for name, fn := range map[string]string{
+		"jsMarkClickableSubmit":    jsMarkClickableSubmit,
+		"jsRequestSubmit":          jsRequestSubmit,
+		"jsSubmitTargetsElsewhere": jsSubmitTargetsElsewhere,
+		"jsSubmitDestination":      jsSubmitDestination,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if !strings.Contains(fn, jsSubmitsOf) {
+				t.Errorf("%s does not use the shared jsSubmitsOf body; a copy will drift", name)
+			}
+			if strings.Count(fn, "const isSubmit") != 1 {
+				t.Errorf("%s defines isSubmit %d times, want exactly the shared one",
+					name, strings.Count(fn, "const isSubmit"))
+			}
+		})
+	}
+
+	// And the rule itself, stated once, still says all three things review
+	// had to teach it.
+	for _, want := range []string{
+		"e.form === f",       // externally associated controls
+		`e.type === "image"`, // image buttons, absent from f.elements
+		`e.tagName === "BUTTON" ? e.type === "submit"`, // <button type=""> via computed type
+	} {
+		if !strings.Contains(jsSubmitsOf, want) {
+			t.Errorf("jsSubmitsOf lost %q", want)
+		}
+	}
+}

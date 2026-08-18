@@ -651,11 +651,30 @@ func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool,
 	return ok, nil
 }
 
+// jsSubmitsOf is the shared body that resolves a form's submit controls. It is
+// spliced into every expression that needs them rather than written out four
+// times, because a duplicated predicate is how three separate review findings
+// happened: the rule was corrected in one copy and left wrong in the others.
+//
+// It expects `f` (the form) and `controls` (the candidate query) in scope, and
+// leaves `submits` defined.
+//
+// Membership is the element's own form owner, so a control associated from
+// outside via form="<id>" counts and an image button — which f.elements
+// excludes by spec — is not lost. Submit-ness is the COMPUTED type, because
+// <button type=""> is a submit button per the spec while matching no attribute
+// selector.
+const jsSubmitsOf = `
+  const isSubmit = (e) => e.form === f &&
+    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
+  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
+`
+
 // jsMarkClickableSubmit stamps the first clickable submit control and reports
 // whether it found one. getClientRects() is the check the spec itself uses for
 // "renders a box": empty for display:none, for a detached node, and for a
 // zero-size element.
-const jsMarkClickableSubmit = `function (formID, marker, controls) {
+var jsMarkClickableSubmit = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return false;
   // Membership is decided by e.form, the element's own form owner, not by
@@ -674,10 +693,7 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
   // spec. e.type covers <button type=""> — any invalid value is a submit button
   // per the spec, and HTMLButtonElement.type reports "submit" for exactly the
   // cases an attribute selector sees nothing.
-  const isSubmit = (e) => e.form === f &&
-    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
-  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
-  // Clear the mark EVERYWHERE, not just from this form's submit controls. A
+` + jsSubmitsOf + `  // Clear the mark EVERYWHERE, not just from this form's submit controls. A
   // mark left on an element that has since changed type or form association
   // would survive, and the click selector — which is document-wide — would
   // press that stale element instead of the control whose destination was just
@@ -708,7 +724,7 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
 // requestSubmit takes the other branch without anything having been sent yet.
 //
 // The id goes through jsString, so any value is a literal.
-const jsRequestSubmit = `function (formID, marker, controls) {
+var jsRequestSubmit = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) throw new Error("form is gone");
   // Membership is decided by e.form, the element's own form owner, not by
@@ -727,10 +743,7 @@ const jsRequestSubmit = `function (formID, marker, controls) {
   // spec. e.type covers <button type=""> — any invalid value is a submit button
   // per the spec, and HTMLButtonElement.type reports "submit" for exactly the
   // cases an attribute selector sees nothing.
-  const isSubmit = (e) => e.form === f &&
-    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
-  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
-  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
+` + jsSubmitsOf + `  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
   f.submit(); return "submit";
 }`
@@ -743,13 +756,10 @@ const jsRequestSubmit = `function (formID, marker, controls) {
 // staying put in THIS document says nothing about whether the sign-in worked.
 // A submitter's formtarget overrides the form's target, so the marked control
 // is consulted first.
-const jsSubmitTargetsElsewhere = `function (formID, marker, controls) {
+var jsSubmitTargetsElsewhere = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return false;
-  const isSubmit = (e) => e.form === f &&
-    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
-  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
-  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
+` + jsSubmitsOf + `  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   const t = (c && c.hasAttribute("formtarget") ? c.getAttribute("formtarget") : f.getAttribute("target")) || "";
   return t !== "" && t !== "_self";
 }`
@@ -1089,7 +1099,7 @@ const jsFormAbsent = `function (formID) {
 // jsSubmitDestination returns the URL the form would POST to: the submitter's
 // formaction when it has one, otherwise the form's action. Both are read as
 // resolved absolute URLs.
-const jsSubmitDestination = `function (formID, marker, controls) {
+var jsSubmitDestination = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return "";
   // Membership is decided by e.form, the element's own form owner, not by
@@ -1108,10 +1118,7 @@ const jsSubmitDestination = `function (formID, marker, controls) {
   // spec. e.type covers <button type=""> — any invalid value is a submit button
   // per the spec, and HTMLButtonElement.type reports "submit" for exactly the
   // cases an attribute selector sees nothing.
-  const isSubmit = (e) => e.form === f &&
-    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
-  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
-  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
+` + jsSubmitsOf + `  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
   return f.action || "";
 }`
