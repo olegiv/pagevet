@@ -143,6 +143,14 @@ change to the worker pool: every URL is loaded in a tab of the one Chrome the ru
 started, so a session established before the pool starts applies to all of them.
 That is the same property listed under "known limitations" below, used on purpose.
 
+**`-timeout` bounds the sign-in too**, not just each crawled page. The whole sequence —
+the optional logout, the login page, filling the form, submitting it and waiting for the
+answer — shares that budget, and each individual step gets a fraction of it so one wrong
+key in `.env` fails in seconds rather than consuming the lot. A slow authentication that
+never navigates, as a single-page login does not, is waited out; one that answers with a
+redirect is judged as soon as that lands. If a sign-in reports running out of time, the
+message says which step did and `-timeout` is the knob.
+
 Two things worth knowing before you point this at anything:
 
 - **Use the lowest-privilege account that can see the pages you are checking.**
