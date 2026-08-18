@@ -37,6 +37,21 @@ type Browser struct {
 	opts     Options
 	product  string // e.g. "Chrome/151.0.7922.138"
 	closeOne sync.Once
+
+	// hostChecked memoizes Options.CheckHost per hostname.
+	//
+	// A sign-in validates up to five addresses — the logout page, the login
+	// page, the form's target before and after the fields are filled, and where
+	// the submission landed — and they are usually all the same host. Each
+	// check is a DNS lookup, and an mDNS ".local" name costs five seconds a
+	// time, which was enough to spend the entire per-URL budget on resolving
+	// one host over and over.
+	//
+	// Caching adds no weakness: the answer for a host cannot change within a
+	// run in any way this program could act on, and input.CheckHost is already
+	// documented as a pre-flight check vulnerable to TOCTOU and DNS rebinding.
+	hostMu      sync.Mutex
+	hostChecked map[string]error
 }
 
 var _ PageLoader = (*Browser)(nil)

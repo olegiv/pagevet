@@ -1,7 +1,9 @@
 package loader
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -257,5 +259,88 @@ func TestCookieName(t *testing.T) {
 	}
 	if got, want := cookieName("bare"), "bare"; got != want {
 		t.Errorf("cookieName() = %q, want %q", got, want)
+	}
+}
+
+// TestCheckHostOnceMemoizes is a budget regression, not a correctness one.
+//
+// A sign-in validates up to five addresses — the logout page, the login page,
+// the form target before and after filling, and where the submission landed —
+// and on a real site they are all the same host. Each uncached check is a DNS
+// lookup; against an mDNS ".local" name those cost seconds apiece and were
+// enough to spend the whole per-URL budget resolving one name repeatedly.
+func TestCheckHostOnceMemoizes(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	b := &Browser{opts: Options{
+		CheckHost: func(context.Context, string) error {
+			calls++
+			return nil
+		},
+	}}
+
+	for range 5 {
+		if err := b.checkHostOnce(t.Context(), "example.com"); err != nil {
+			t.Fatalf("checkHostOnce() error = %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("CheckHost called %d times for one host, want 1", calls)
+	}
+
+	// A different host is still its own question.
+	if err := b.checkHostOnce(t.Context(), "other.example"); err != nil {
+		t.Fatalf("checkHostOnce() error = %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("CheckHost called %d times for two hosts, want 2", calls)
+	}
+}
+
+// TestCheckHostOnceRemembersRejection keeps the cache from being a way past the
+// policy: a blocked host stays blocked on every later check.
+func TestCheckHostOnceRemembersRejection(t *testing.T) {
+	t.Parallel()
+
+	blocked := errors.New("blocked by the address policy")
+	b := &Browser{opts: Options{
+		CheckHost: func(_ context.Context, host string) error {
+			if host == "169.254.169.254" {
+				return blocked
+			}
+			return nil
+		},
+	}}
+
+	for i := range 3 {
+		if err := b.checkHostOnce(t.Context(), "169.254.169.254"); !errors.Is(err, blocked) {
+			t.Errorf("check %d = %v, want the rejection to persist", i, err)
+		}
+	}
+}
+
+// TestCheckHostOnceDoesNotCacheACanceledCheck matters because CheckHost reports
+// a canceled lookup as "no opinion". Remembering that would let one interrupted
+// check bless a host for the rest of the run.
+func TestCheckHostOnceDoesNotCacheACanceledCheck(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	b := &Browser{opts: Options{
+		CheckHost: func(context.Context, string) error {
+			calls++
+			return nil
+		},
+	}}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_ = b.checkHostOnce(ctx, "example.com")
+
+	// A later check on a live context must ask again.
+	_ = b.checkHostOnce(t.Context(), "example.com")
+	if calls != 2 {
+		t.Errorf("CheckHost called %d times, want 2: a canceled check must not be cached", calls)
 	}
 }

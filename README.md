@@ -352,3 +352,11 @@ about unchecked `fmt.Fprintf` and `gosec` in test files.
    the old behaviour if you need it.
 7. **This is not a spider.** It reads a fixed list and renders each page once. It never follows links,
    honours `robots.txt`, or discovers URLs.
+8. **`-login` cannot stop a hostile login page from redirecting your credentials away.** pagevet checks the
+   login page, the page it redirects to, the form's `action`, and the target again after the fields are
+   filled — but a 307 or 308 answer to the POST itself preserves the method and body, and Chrome follows it
+   before pagevet regains control. The run then fails loudly and says the credentials may have travelled,
+   which is detection, not prevention. Preventing it needs CDP request interception, vetting every request
+   before Chrome sends it. As with the address guard generally: this is defence in depth against an accident
+   in your own `.env`, not a boundary against a login page written by an attacker. Point `-login` at sites
+   you control.

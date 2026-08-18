@@ -168,6 +168,13 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 			return fmt.Errorf("%w: opening the logout page %s: %w. Check LOGOUT_PATH, or remove it",
 				ErrLoginFailed, b.display(spec.LogoutURL), err)
 		}
+		// The logout page may redirect too, and only the CONFIGURED host was
+		// checked before the browser started. No credentials are typed here,
+		// but the address policy is about where this program points Chrome at
+		// all, not only about where it types.
+		if err := b.checkCommitted(ctx, "the logout page "+b.display(spec.LogoutURL)); err != nil {
+			return err
+		}
 	}
 
 	if _, err := chromedp.RunResponse(ctx, chromedp.Navigate(spec.URL)); err != nil {
@@ -182,7 +189,7 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// origin is legitimate (an SSO hop), so this does not demand the origin be
 	// unchanged - it demands the destination pass the same checks the
 	// configured one did.
-	if err := b.checkCommittedPage(ctx, spec); err != nil {
+	if err := b.checkCommitted(ctx, b.display(spec.URL)); err != nil {
 		return err
 	}
 
@@ -211,7 +218,7 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// action points at a blocked address, and a cross-origin form submission
 	// needs no CORS permission — so this has to be settled before the password
 	// is typed, not after.
-	if destErr := b.checkSubmitDestination(ctx, spec, spec.FormID); destErr != nil {
+	if destErr := b.checkSubmitDestination(ctx, formLabel, spec.FormID); destErr != nil {
 		return destErr
 	}
 
@@ -243,6 +250,19 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		// Best effort: the checks below are the real verdict, and a canceled
 		// sleep will show up there as a much clearer failure than here.
 		_ = chromedp.Run(ctx, chromedp.Sleep(b.opts.Settle))
+	}
+
+	// Where did the submission actually end up?
+	//
+	// This is DETECTION, not prevention, and the difference matters. A 307 or
+	// 308 answer from an allowed form target preserves the POST method and
+	// body, so Chrome re-sends the credentials to wherever it points before
+	// this code regains control. Nothing here can stop that; what it can do is
+	// refuse to pretend the run was fine, and say plainly that the credentials
+	// may have traveled. Preventing it needs CDP request interception — see
+	// the known limitation in README.md.
+	if landedErr := b.checkCommitted(ctx, "the submitted form "+formLabel); landedErr != nil {
+		return fmt.Errorf("%w. The credentials may already have reached it", landedErr)
 	}
 
 	after, err := cookieDigests(ctx)
@@ -321,8 +341,31 @@ func (b *Browser) fillField(sel, value string) chromedp.Action {
 				WithCommands([]string{"deleteBackward"}).
 				Do(ctx)
 		}),
-		chromedp.SendKeys(sel, value, chromedp.ByQuery),
+		typeInto(sel, value),
 	}
+}
+
+// typeInto puts value into the focused field.
+//
+// SendKeys dispatches real key events, which is what a framework-controlled
+// input needs to see — but it INTERPRETS the text as keystrokes, so a tab
+// becomes a focus change and a newline becomes Enter. The .env parser decodes
+// \t and \n escapes and the password check deliberately allows the result,
+// so a password containing either would tab away mid-entry or submit the form
+// with half a password in it — and, worse, submit it a second time when the
+// explicit submission followed.
+//
+// Such a password is rare, so the common path keeps the key events it was
+// chosen for, and only a value SendKeys would misread is inserted as literal
+// text instead. Input.insertText still fires an input event, which is what
+// controlled components listen for.
+func typeInto(sel, value string) chromedp.Action {
+	if !strings.ContainsAny(value, "\r\n\t") {
+		return chromedp.SendKeys(sel, value, chromedp.ByQuery)
+	}
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		return input.InsertText(value).Do(ctx)
+	})
 }
 
 // submitControls is the query for a form's submit controls. A <button> with no
@@ -373,6 +416,16 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
 	clickable, err := b.markClickableSubmit(ctx, formID)
 	if err != nil {
 		return fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
+	}
+
+	// The destination was checked before the fields were filled, but the
+	// selection above deliberately runs AGAIN afterwards, because filling can
+	// run page script that enables a different button. That script can equally
+	// well have changed form.action, or the newly-enabled control can carry its
+	// own formaction — so the target is re-checked against the FINAL selection,
+	// immediately before anything is dispatched.
+	if destErr := b.checkSubmitDestination(ctx, formLabel, formID); destErr != nil {
+		return destErr
 	}
 
 	submitExpr, err := jsCall(jsRequestSubmit, formID, submitMarker, submitControls)
@@ -442,8 +495,13 @@ func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool,
 const jsMarkClickableSubmit = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return false;
-  for (const c of f.querySelectorAll(controls)) { c.removeAttribute(marker); }
-  for (const c of f.querySelectorAll(controls)) {
+  // form.elements includes controls associated from OUTSIDE the form via
+  // form="<id>", which a descendant query never sees. <button form="login"
+  // name="op" formaction="/authenticate"> is valid markup, and its name, value
+  // and formaction all matter.
+  const submits = Array.from(f.elements).filter((e) => e.matches(controls));
+  for (const c of submits) { c.removeAttribute(marker); }
+  for (const c of submits) {
     if (c.disabled) continue;
     if (c.getClientRects().length === 0) continue;
     const st = getComputedStyle(c);
@@ -471,7 +529,12 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
 const jsRequestSubmit = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) throw new Error("form is gone");
-  const c = f.querySelector("[" + marker + "]") || f.querySelector(controls);
+  // form.elements includes controls associated from OUTSIDE the form via
+  // form="<id>", which a descendant query never sees. <button form="login"
+  // name="op" formaction="/authenticate"> is valid markup, and its name, value
+  // and formaction all matter.
+  const submits = Array.from(f.elements).filter((e) => e.matches(controls));
+  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
   f.submit(); return "submit";
 }`
@@ -487,7 +550,7 @@ const jsRequestSubmit = `function (formID, marker, controls) {
 //
 // The submitter's formaction overrides the form's action, so the control this
 // run intends to use is consulted too. Both are read as resolved absolute URLs.
-func (b *Browser) checkSubmitDestination(ctx context.Context, spec *login.Spec, formID string) error {
+func (b *Browser) checkSubmitDestination(ctx context.Context, formLabel, formID string) error {
 	expr, err := jsCall(jsSubmitDestination, formID, submitMarker, submitControls)
 	if err != nil {
 		return err
@@ -505,7 +568,7 @@ func (b *Browser) checkSubmitDestination(ctx context.Context, spec *login.Spec, 
 		// we are.
 		return nil
 	}
-	return b.checkDestination(ctx, "the form on "+b.display(spec.URL), dest)
+	return b.checkDestination(ctx, "the form "+formLabel, dest)
 }
 
 // cookieDigests returns every cookie in the browser's jar as name -> digest of
@@ -567,15 +630,47 @@ func cookieName(key string) string {
 	return name
 }
 
-// checkCommittedPage re-runs the address policy against the page that actually
-// committed, which after redirects need not be the one that was configured.
-func (b *Browser) checkCommittedPage(ctx context.Context, spec *login.Spec) error {
+// checkHostOnce applies the address policy to a host, reusing the answer it
+// already has for that host. See Browser.hostChecked for why.
+//
+// A plain map under a mutex rather than a sync.Map: the entries are answers to
+// "is this host allowed", so storing them typed keeps an unchecked type
+// assertion out of the one path that decides whether credentials may be sent.
+func (b *Browser) checkHostOnce(ctx context.Context, host string) error {
+	b.hostMu.Lock()
+	cached, ok := b.hostChecked[host]
+	b.hostMu.Unlock()
+	if ok {
+		return cached
+	}
+
+	err := b.opts.CheckHost(ctx, host)
+
+	// A canceled lookup is not cached: CheckHost reports one as "no opinion",
+	// and remembering that would let an interrupted check bless the host for
+	// the rest of the run.
+	if ctx.Err() == nil {
+		b.hostMu.Lock()
+		if b.hostChecked == nil {
+			b.hostChecked = make(map[string]error, 4)
+		}
+		b.hostChecked[host] = err
+		b.hostMu.Unlock()
+	}
+	return err
+}
+
+// checkCommitted re-runs the address policy against the page that actually
+// committed, which after redirects need not be the one that was navigated to.
+//
+// what names the thing being checked, for the error message.
+func (b *Browser) checkCommitted(ctx context.Context, what string) error {
 	var href string
 	if err := chromedp.Run(ctx, chromedp.Evaluate("document.location.href", &href)); err != nil {
 		return fmt.Errorf("%w: reading the address of %s after navigation: %w",
-			ErrLoginFailed, b.display(spec.URL), err)
+			ErrLoginFailed, what, err)
 	}
-	return b.checkDestination(ctx, b.display(spec.URL), href)
+	return b.checkDestination(ctx, what, href)
 }
 
 // checkDestination applies the run's address policy to one absolute URL.
@@ -598,7 +693,7 @@ func (b *Browser) checkDestination(ctx context.Context, what, rawURL string) err
 	if b.opts.CheckHost == nil {
 		return nil
 	}
-	if err := b.opts.CheckHost(ctx, u.Hostname()); err != nil {
+	if err := b.checkHostOnce(ctx, u.Hostname()); err != nil {
 		return fmt.Errorf("%w: %s leads to %s, which fails the address policy: %w. "+
 			"Refusing to enter credentials", ErrLoginFailed, what, b.display(rawURL), err)
 	}
@@ -678,7 +773,12 @@ const jsFormAbsent = `function (formID) {
 const jsSubmitDestination = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return "";
-  const c = f.querySelector("[" + marker + "]") || f.querySelector(controls);
+  // form.elements includes controls associated from OUTSIDE the form via
+  // form="<id>", which a descendant query never sees. <button form="login"
+  // name="op" formaction="/authenticate"> is valid markup, and its name, value
+  // and formaction all matter.
+  const submits = Array.from(f.elements).filter((e) => e.matches(controls));
+  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
   return f.action || "";
 }`
