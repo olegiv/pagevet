@@ -250,6 +250,13 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	}
 
 	// submit builds its own message, including the ErrLoginFailed wrapper.
+	// Ask BEFORE submitting, while the form is still in the document to be
+	// asked about.
+	targeted, targetErr := b.submitTargetsElsewhere(ctx, spec.FormID)
+	if targetErr != nil {
+		return targetErr
+	}
+
 	navigated, submitErr := b.submit(ctx, formLabel, spec.FormID)
 	if submitErr != nil {
 		return submitErr
@@ -320,7 +327,11 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		if err != nil {
 			return fmt.Errorf("%w: checking whether %s is gone: %w", ErrLoginFailed, formLabel, err)
 		}
-		if len(changed) > 0 && formGone {
+		// A targeted submission sends its answer to another tab or frame, so
+		// this document keeping its form is expected and proves nothing. The
+		// session-state half still has to hold — the cookie jar is shared
+		// across contexts, which is the whole mechanism this feature runs on.
+		if len(changed) > 0 && (formGone || targeted) {
 			return nil
 		}
 
@@ -334,6 +345,10 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// The three failures below are worded to be told apart at a glance, because
 	// they have completely different fixes.
 	switch {
+	case targeted:
+		return fmt.Errorf("%w: submitted %s, which targets another tab or frame, and no cookie or "+
+			"stored session changed. The form staying on this page is expected for such a form and "+
+			"is not the problem", ErrLoginFailed, b.display(spec.URL))
 	case len(changed) == 0 && !formGone:
 		return fmt.Errorf("%w: submitted %s but nothing happened: no cookie or stored session changed, "+
 			"and %s is still on the page. The usual cause is wrong credentials",
@@ -429,8 +444,13 @@ const jsMarkField = `function (formID, name, marker) {
   const chosen = named.find(visible) || named[0];
   if (!chosen) return "";
   chosen.setAttribute(marker, "");
+  // The COMPUTED type, not the attribute. <input type="username"> is an
+  // invalid value, so HTML treats the control as a text input and .type
+  // reports "text" — while the raw attribute would fail the allowlist and
+  // reject a perfectly usable form. It still reports "file" for a file input,
+  // which is the case the allowlist exists to catch.
   const tag = chosen.tagName.toLowerCase();
-  return tag === "input" ? "input:" + (chosen.getAttribute("type") || "text").toLowerCase() : tag;
+  return tag === "input" ? "input:" + chosen.type.toLowerCase() : tag;
 }`
 
 // markCredentialField chooses the control for one credential, stamps it, and
@@ -715,6 +735,42 @@ const jsRequestSubmit = `function (formID, marker, controls) {
   f.submit(); return "submit";
 }`
 
+// jsSubmitTargetsElsewhere reports whether the form, or the control chosen to
+// submit it, sends its response to another browsing context.
+//
+// target="_blank", or a name that is not this window, means the answer arrives
+// in a tab or frame that is not the one being examined — so the login form
+// staying put in THIS document says nothing about whether the sign-in worked.
+// A submitter's formtarget overrides the form's target, so the marked control
+// is consulted first.
+const jsSubmitTargetsElsewhere = `function (formID, marker, controls) {
+  const f = document.getElementById(formID);
+  if (!f) return false;
+  const isSubmit = (e) => e.form === f &&
+    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
+  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
+  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
+  const t = (c && c.hasAttribute("formtarget") ? c.getAttribute("formtarget") : f.getAttribute("target")) || "";
+  return t !== "" && t !== "_self";
+}`
+
+// submitTargetsElsewhere reports whether submitting this form sends its answer
+// to another browsing context. See jsSubmitTargetsElsewhere.
+func (b *Browser) submitTargetsElsewhere(ctx context.Context, formID string) (bool, error) {
+	expr, err := jsCall(jsSubmitTargetsElsewhere, formID, submitMarker, submitControls)
+	if err != nil {
+		return false, err
+	}
+
+	var targeted bool
+	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
+	defer cancel()
+	if err := chromedp.Run(stepCtx, chromedp.Evaluate(expr, &targeted)); err != nil {
+		return false, fmt.Errorf("%w: reading the submission target of %s: %w", ErrLoginFailed, formID, err)
+	}
+	return targeted, nil
+}
+
 // checkSubmitDestination validates where the form would POST, before anything
 // is typed into it.
 //
@@ -939,7 +995,12 @@ func (b *Browser) checkCommitted(ctx context.Context, what string) error {
 func (b *Browser) checkDestination(ctx context.Context, what, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("%w: %s leads to an unparseable address: %w", ErrLoginFailed, what, err)
+		// Neither the URL nor the error is printed raw. url.Parse returns a
+		// *url.Error carrying the WHOLE url, so %w would leak a form action
+		// like https://user:pass@host/%zz?token=... straight to stderr —
+		// before any credential has even been typed.
+		return fmt.Errorf("%w: %s leads to an unparseable address %s: %s",
+			ErrLoginFailed, what, login.SafeURLPreview(rawURL), login.ParseReason(err))
 	}
 
 	// Same positive allowlist internal/input applies to every crawled URL. A
@@ -1080,8 +1141,9 @@ func formAbsent(ctx context.Context, formID string) (bool, error) {
 func (b *Browser) displayTarget(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		// Unparseable: say nothing rather than guess which part is a secret.
-		return "(unparseable address)"
+		// Unparseable, so fall back to the textual scrub, which needs no
+		// successful parse and removes userinfo, query and fragment alike.
+		return login.SafeURLPreview(rawURL)
 	}
 	u.RawQuery = ""
 	u.Fragment = ""

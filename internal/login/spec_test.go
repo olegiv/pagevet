@@ -594,8 +594,8 @@ func TestSafeURLPreview(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {
 			t.Parallel()
-			if got := safeURLPreview(tt.in); got != tt.want {
-				t.Errorf("safeURLPreview(%q) = %s, want %s", tt.in, got, tt.want)
+			if got := SafeURLPreview(tt.in); got != tt.want {
+				t.Errorf("SafeURLPreview(%q) = %s, want %s", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -617,12 +617,12 @@ func TestSafeURLPreviewScrubsOpaqueURLs(t *testing.T) {
 	} {
 		t.Run(raw, func(t *testing.T) {
 			t.Parallel()
-			got := safeURLPreview(raw)
+			got := SafeURLPreview(raw)
 			if strings.Contains(got, secret) {
-				t.Errorf("safeURLPreview(%q) = %s, leaks the credential", raw, got)
+				t.Errorf("SafeURLPreview(%q) = %s, leaks the credential", raw, got)
 			}
 			if !strings.Contains(got, "example.test") {
-				t.Errorf("safeURLPreview(%q) = %s, want the host kept", raw, got)
+				t.Errorf("SafeURLPreview(%q) = %s, want the host kept", raw, got)
 			}
 		})
 	}
@@ -646,5 +646,31 @@ func TestResolveNeverEchoesOpaqueURLCredentials(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Errorf("error leaks the credential: %q", err)
+	}
+}
+
+// TestSafeURLPreviewStripsFragment is an OAuth-token regression. Implicit flows
+// put #access_token= in the fragment, which is exactly why the crawler's own
+// redaction drops it — a preview that kept it would be the one place this
+// program prints what everything else removes.
+func TestSafeURLPreviewStripsFragment(t *testing.T) {
+	t.Parallel()
+
+	secret := testConfig().Password + "-in-fragment"
+	for _, raw := range []string{
+		"https://example.test/%zz#access_token=" + secret,
+		"https://example.test/login#" + secret,
+		"https://user:pw@example.test/%zz?a=1#access_token=" + secret,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			got := SafeURLPreview(raw)
+			if strings.Contains(got, secret) {
+				t.Errorf("SafeURLPreview(%q) = %s, leaks the fragment", raw, got)
+			}
+			if !strings.Contains(got, "example.test") {
+				t.Errorf("SafeURLPreview(%q) = %s, want the host kept", raw, got)
+			}
+		})
 	}
 }

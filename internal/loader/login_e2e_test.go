@@ -973,3 +973,32 @@ func TestLogin_SkipsControlsInADisabledFieldset(t *testing.T) {
 		t.Errorf("/private after Login = %d, want 200", res.Status)
 	}
 }
+
+// TestLogin_FormTargetingAnotherContext covers target="_blank": the response,
+// and the Set-Cookie with it, arrives in another tab while this document keeps
+// its form. Requiring the form to disappear rejected a sign-in that worked.
+func TestLogin_FormTargetingAnotherContext(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-targetblank") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; a targeted submission was judged by the wrong document", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_InvalidInputTypeIsStillTypable covers <input type="username">. The
+// browser treats an invalid type as text; only the raw attribute says otherwise.
+func TestLogin_InvalidInputTypeIsStillTypable(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-oddtype") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; an invalid input type was rejected instead of treated as text", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}

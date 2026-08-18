@@ -384,3 +384,10 @@ about unchecked `fmt.Fprintf` and `gosec` in test files.
    before Chrome sends it. As with the address guard generally: this is defence in depth against an accident
    in your own `.env`, not a boundary against a login page written by an attacker. Point `-login` at sites
    you control.
+9. **A failed login can satisfy both success signals.** The common post/redirect/get failure — wrong
+   credentials, the server rotates a flash or session cookie and redirects to a dedicated error page that
+   carries no login form — changes the session state *and* removes the form, which is everything `-login`
+   checks. pagevet then reports success and crawls anonymously. The two signals are strong evidence that
+   *something happened*, not proof of *who you are*; proving that needs a request whose answer depends on
+   the account, which pagevet has no way to know for your site. Read the first few results of a `-login`
+   run before trusting a long one: a page you expect to be private coming back 403 is the tell.

@@ -96,6 +96,8 @@ func Handler(logf func(format string, args ...any)) http.Handler {
 	mux.HandleFunc("/login-slowpost", f.loginSlowPost)
 	mux.HandleFunc("/login-typelessbutton", f.loginTypelessButton)
 	mux.HandleFunc("/login-disabledfieldset", f.loginDisabledFieldset)
+	mux.HandleFunc("/login-targetblank", f.loginTargetBlank)
+	mux.HandleFunc("/login-oddtype", f.loginOddInputType)
 	mux.HandleFunc("/logout", f.logout)
 	mux.HandleFunc("/grant", f.grant)
 	mux.HandleFunc("/private", f.private)

@@ -154,7 +154,7 @@ func (c Config) resolveOne(key, value, firstURL string) (string, error) {
 		// whole URL inside its own *url.Error - so quoting either would put
 		// credentials on stderr before any redaction path exists.
 		return "", fmt.Errorf("%w: %s: %s=%s is not a valid URL or path: %s",
-			ErrConfig, display(c.path), key, safeURLPreview(value), parseReason(err))
+			ErrConfig, display(c.path), key, SafeURLPreview(value), ParseReason(err))
 	}
 
 	if !ref.IsAbs() {
@@ -162,7 +162,7 @@ func (c Config) resolveOne(key, value, firstURL string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%w: %s is a path, so it resolves against the first URL "+
 				"in the input file, but %s does not parse: %s",
-				ErrConfig, key, safeURLPreview(firstURL), parseReason(err))
+				ErrConfig, key, SafeURLPreview(firstURL), ParseReason(err))
 		}
 		// Origin only. ResolveReference against the full first URL would let a
 		// relative path land somewhere that depends on that URL's path, which
@@ -180,7 +180,7 @@ func (c Config) resolveOne(key, value, firstURL string) (string, error) {
 	}
 	if ref.Host == "" {
 		return "", fmt.Errorf("%w: %s: %s=%s has no host",
-			ErrConfig, display(c.path), key, safeURLPreview(value))
+			ErrConfig, display(c.path), key, SafeURLPreview(value))
 	}
 	return ref.String(), nil
 }
@@ -244,14 +244,17 @@ func (s Spec) Describe(redactedURL string) string {
 	return fmt.Sprintf("%s at %s (form %s)", s.Username, redactedURL, s.FormID)
 }
 
-// safeURLPreview renders a URL for an error message with the two places
-// credentials hide removed: the userinfo, and the query values.
+// SafeURLPreview renders a URL for an error message with the three places
+// credentials hide removed: the userinfo, the query, and the fragment.
+//
+// Exported because internal/loader has the same obligation on URLs the browser
+// resolved, and one tested implementation is worth more than two.
 //
 // It works on a string that may not parse, which is exactly when it is needed —
 // the redaction in internal/verdict operates on a parsed URL and is unavailable
 // here anyway, since this package imports nothing outside the standard library.
 // Scheme, host and path survive, which is what a user needs to spot the typo.
-func safeURLPreview(raw string) string {
+func SafeURLPreview(raw string) string {
 	s := raw
 
 	// Userinfo is scrubbed whether or not the URL has an authority component.
@@ -273,6 +276,13 @@ func safeURLPreview(raw string) string {
 			s = s[:start] + rest[at+1:]
 		}
 	}
+	// Query AND fragment. The fragment is where OAuth implicit flows put
+	// #access_token=, which is exactly why the crawler's own redaction drops
+	// it — a preview that kept it would be the one place this program prints
+	// what everything else is careful to remove.
+	if h := strings.IndexByte(s, '#'); h >= 0 {
+		s = s[:h] + "#..."
+	}
 	if q := strings.IndexByte(s, '?'); q >= 0 {
 		s = s[:q] + "?..."
 	}
@@ -290,9 +300,9 @@ func leadingSlashes(s string) string {
 	return s[:i]
 }
 
-// parseReason extracts the reason from a *url.Error without its URL field,
+// ParseReason extracts the reason from a *url.Error without its URL field,
 // which holds the whole value the caller is trying not to print.
-func parseReason(err error) string {
+func ParseReason(err error) string {
 	var uerr *url.Error
 	if errors.As(err, &uerr) && uerr.Err != nil {
 		return uerr.Err.Error()

@@ -856,3 +856,42 @@ func (f *fixture) loginDisabledFieldset(w http.ResponseWriter, r *http.Request) 
 </form>
 `, LoginFormID, LoginUserField, LoginPassField, LoginUserField, LoginPassField))
 }
+
+// loginTargetBlank submits into another browsing context. The response — and
+// the Set-Cookie with it — arrives in that other tab, while this document keeps
+// its form, so "the form went away" says nothing about whether the sign-in
+// worked. The shared cookie jar still does.
+func (f *fixture) loginTargetBlank(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		f.loginSubmit(w, r)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-targetblank" target="_blank">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField))
+}
+
+// loginOddInputType uses an INVALID input type. HTML treats it as a text input,
+// but the raw attribute reads back as written — so a check on the attribute
+// rejects a form the browser is perfectly happy to fill.
+func (f *fixture) loginOddInputType(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		f.loginSubmit(w, r)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-oddtype">
+  <input type="username" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField))
+}
