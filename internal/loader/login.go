@@ -250,7 +250,8 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	}
 
 	// submit builds its own message, including the ErrLoginFailed wrapper.
-	if submitErr := b.submit(ctx, formLabel, spec.FormID); submitErr != nil {
+	navigated, submitErr := b.submit(ctx, formLabel, spec.FormID)
+	if submitErr != nil {
 		return submitErr
 	}
 
@@ -271,22 +272,66 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// refuse to pretend the run was fine, and say plainly that the credentials
 	// may have traveled. Preventing it needs CDP request interception — see
 	// the known limitation in README.md.
-	if landedErr := b.checkCommitted(ctx, "the submitted form "+formLabel); landedErr != nil {
-		return fmt.Errorf("%w. The credentials may already have reached it", landedErr)
+	// Poll the verdict rather than reading it once.
+	//
+	// The submission is dispatched exactly once and never repeated, so the only
+	// question left is how long to wait for it to take effect. A POST — or an
+	// SPA's fetch — can finish well after the navigation wait gave up while
+	// still being comfortably inside the overall budget, and checking a single
+	// time meant a valid slow authentication was reported as exit 5 against a
+	// document that had simply not caught up yet.
+	//
+	// The last observation is what the failure message is built from, so a run
+	// that genuinely did not authenticate still says exactly which check failed.
+	// Poll only when the submission did NOT navigate.
+	//
+	// A completed navigation means the document being examined IS the answer to
+	// the submission: a wrong password has already re-rendered the form, and
+	// waiting longer changes nothing but the user's patience. The cases that
+	// need time are the ones with no navigation to observe — a POST slower than
+	// the navigation wait, and an SPA that authenticates over fetch and never
+	// navigates at all.
+	//
+	// Bounded even then: polling to the end of the overall budget would make a
+	// mistyped password cost the full -timeout before saying so.
+	pollFor := time.Duration(0)
+	if !navigated {
+		pollFor = b.findTimeout()
+	}
+	pollCtx, cancelPoll := context.WithTimeout(ctx, pollFor)
+	defer cancelPoll()
+
+	var (
+		changed  []string
+		formGone bool
+	)
+	for {
+		if landedErr := b.checkCommitted(ctx, "the submitted form "+formLabel); landedErr != nil {
+			return fmt.Errorf("%w. The credentials may already have reached it", landedErr)
+		}
+
+		after, err := b.takeSnapshot(ctx)
+		if err != nil {
+			return fmt.Errorf("%w: reading the session state after submit: %w", ErrLoginFailed, err)
+		}
+		changed = after.changedSince(before)
+
+		formGone, err = formAbsent(ctx, spec.FormID)
+		if err != nil {
+			return fmt.Errorf("%w: checking whether %s is gone: %w", ErrLoginFailed, formLabel, err)
+		}
+		if len(changed) > 0 && formGone {
+			return nil
+		}
+
+		// Out of polling budget, or the caller gave up: report what was last
+		// seen.
+		if ctx.Err() != nil || !sleepWithin(pollCtx, verdictPollInterval) {
+			break
+		}
 	}
 
-	after, err := b.takeSnapshot(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: reading the session state after submit: %w", ErrLoginFailed, err)
-	}
-	changed := after.changedSince(before)
-
-	formGone, err := formAbsent(ctx, spec.FormID)
-	if err != nil {
-		return fmt.Errorf("%w: checking whether %s is gone: %w", ErrLoginFailed, formLabel, err)
-	}
-
-	// The two failures below are worded to be told apart at a glance, because
+	// The three failures below are worded to be told apart at a glance, because
 	// they have completely different fixes.
 	switch {
 	case len(changed) == 0 && !formGone:
@@ -296,12 +341,28 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	case len(changed) == 0:
 		return fmt.Errorf("%w: %s went away after submit, but no cookie or stored session changed, so "+
 			"there is no session to crawl with", ErrLoginFailed, formLabel)
-	case !formGone:
+	default:
 		return fmt.Errorf("%w: the session state changed (%s) but %s is still on the page. If this site "+
 			"shows its login form to signed-in users too, this check is the one to revisit",
 			ErrLoginFailed, joinNames(changed), formLabel)
 	}
-	return nil
+}
+
+// verdictPollInterval is how often the post-submit signals are re-read. Short
+// enough that a fast login is not noticeably delayed, long enough that a slow
+// one does not spend the budget on round trips.
+const verdictPollInterval = 250 * time.Millisecond
+
+// sleepWithin waits for d, reporting false if the context ran out first.
+func sleepWithin(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // fieldSelector matches a named control of the form, whether it sits inside the
@@ -359,7 +420,11 @@ const jsMarkField = `function (formID, name, marker) {
   // password would be typed into whichever came first — the username box.
   for (const e of document.querySelectorAll("[" + marker + "]")) { e.removeAttribute(marker); }
   const named = Array.from(document.getElementsByName(name)).filter((e) => e.form === f);
-  const visible = (e) => !e.disabled && e.getClientRects().length > 0 &&
+  // :disabled rather than .disabled — a control inside <fieldset disabled> has
+  // .disabled false while HTML treats it as disabled for focus and for
+  // submission, so filling it would put the credential somewhere the request
+  // never carries.
+  const visible = (e) => !e.matches(":disabled") && e.getClientRects().length > 0 &&
     getComputedStyle(e).visibility !== "hidden";
   const chosen = named.find(visible) || named[0];
   if (!chosen) return "";
@@ -436,13 +501,19 @@ func (b *Browser) fillField(sel, value string) chromedp.Action {
 	}
 }
 
-// submitControls is the query for a form's submit controls.
+// submitControls is the CANDIDATE query for a form's submit controls. It casts
+// wide on purpose and lets the JavaScript predicate decide, because no CSS
+// selector expresses what HTML actually means by "submit button".
 //
-// Three forms, because HTML has three. A <button> with no type attribute is a
-// submit button per the spec, but [type="submit"] matches on the attribute
-// being literally present. And <input type="image"> is a submit control too,
-// with its own formaction and its own submitted name and coordinate fields.
-const submitControls = `[type="submit"], [type="image"], button:not([type])`
+// A <button> with no type attribute is a submit button; so is one with an
+// INVALID type, including type="" — but an attribute selector sees a present
+// attribute and matches neither :not([type]) nor [type="submit"]. Only the
+// computed .type reports "submit" for all of them. <input type="image"> is a
+// submit control too, with its own formaction and name.x/name.y fields.
+//
+// Filtering a few dozen elements in the page costs nothing; missing the control
+// that carries name="op" costs a login.
+const submitControls = `button, input`
 
 // submitMarker is stamped on the control this run intends to click, so Go can
 // address the exact element JavaScript chose. querySelector returns only the
@@ -480,13 +551,13 @@ const submitMarker = "data-pagevet-submit"
 // reported exit 5 on a sign-in that had plainly worked. When no navigation
 // arrives, the cookie and form checks in doLogin are left to judge the outcome
 // — which is what they are for.
-func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
+func (b *Browser) submit(ctx context.Context, formLabel, formID string) (navigated bool, err error) {
 	// Re-mark rather than trusting the earlier pass: filling the fields can run
 	// page script that enables a previously disabled button, which is a common
 	// "enable Sign in once both fields are non-empty" pattern.
 	clickable, err := b.markClickableSubmit(ctx, formID)
 	if err != nil {
-		return fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
+		return false, fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
 	}
 
 	// The destination was checked before the fields were filled, but the
@@ -496,12 +567,12 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
 	// own formaction — so the target is re-checked against the FINAL selection,
 	// immediately before anything is dispatched.
 	if destErr := b.checkSubmitDestination(ctx, formLabel, formID); destErr != nil {
-		return destErr
+		return false, destErr
 	}
 
 	submitExpr, err := jsCall(jsRequestSubmit, formID, submitMarker, submitControls)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	how := "calling requestSubmit() on it"
@@ -520,18 +591,19 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) error {
 	if _, err := chromedp.RunResponse(waitCtx, action); err != nil {
 		switch {
 		case ctx.Err() != nil:
-			return fmt.Errorf("%w: submitting %s by %s: %w", ErrLoginFailed, formLabel, how, err)
+			return false, fmt.Errorf("%w: submitting %s by %s: %w", ErrLoginFailed, formLabel, how, err)
 		case waitCtx.Err() != nil:
 			// No navigation within the window. Either the page authenticated
-			// without one, or nothing happened; doLogin's two checks tell those
-			// apart, and re-sending the credentials is never the answer.
-			return nil
+			// without one — a slow POST, or an SPA that never navigates at all
+			// — or nothing happened. doLogin's checks tell those apart, and
+			// re-sending the credentials is never the answer.
+			return false, nil
 		default:
-			return fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
+			return false, fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
 				"sent; pagevet will not submit them a second time)", ErrLoginFailed, formLabel, how, err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // markClickableSubmit finds the first submit control that could actually be
@@ -574,7 +646,17 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
   // the spec has it exclude input elements in the Image Button state, so
   // <input type="image"> — a submit control with its own formaction and its own
   // name.x/name.y fields — is absent from it entirely.
-  const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
+  // Membership and submit-ness in one predicate, using the element's own form
+  // owner and its COMPUTED type.
+  //
+  // e.form covers <button form="login"> placed elsewhere in the document, which
+  // a descendant query misses, and image buttons, which f.elements excludes by
+  // spec. e.type covers <button type=""> — any invalid value is a submit button
+  // per the spec, and HTMLButtonElement.type reports "submit" for exactly the
+  // cases an attribute selector sees nothing.
+  const isSubmit = (e) => e.form === f &&
+    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
+  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
   // Clear the mark EVERYWHERE, not just from this form's submit controls. A
   // mark left on an element that has since changed type or form association
   // would survive, and the click selector — which is document-wide — would
@@ -582,7 +664,7 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
   // validated.
   for (const c of document.querySelectorAll("[" + marker + "]")) { c.removeAttribute(marker); }
   for (const c of submits) {
-    if (c.disabled) continue;
+    if (c.matches(":disabled")) continue;
     if (c.getClientRects().length === 0) continue;
     const st = getComputedStyle(c);
     if (st.visibility === "hidden" || st.display === "none") continue;
@@ -617,7 +699,17 @@ const jsRequestSubmit = `function (formID, marker, controls) {
   // the spec has it exclude input elements in the Image Button state, so
   // <input type="image"> — a submit control with its own formaction and its own
   // name.x/name.y fields — is absent from it entirely.
-  const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
+  // Membership and submit-ness in one predicate, using the element's own form
+  // owner and its COMPUTED type.
+  //
+  // e.form covers <button form="login"> placed elsewhere in the document, which
+  // a descendant query misses, and image buttons, which f.elements excludes by
+  // spec. e.type covers <button type=""> — any invalid value is a submit button
+  // per the spec, and HTMLButtonElement.type reports "submit" for exactly the
+  // cases an attribute selector sees nothing.
+  const isSubmit = (e) => e.form === f &&
+    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
+  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
   const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
   f.submit(); return "submit";
@@ -947,7 +1039,17 @@ const jsSubmitDestination = `function (formID, marker, controls) {
   // the spec has it exclude input elements in the Image Button state, so
   // <input type="image"> — a submit control with its own formaction and its own
   // name.x/name.y fields — is absent from it entirely.
-  const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
+  // Membership and submit-ness in one predicate, using the element's own form
+  // owner and its COMPUTED type.
+  //
+  // e.form covers <button form="login"> placed elsewhere in the document, which
+  // a descendant query misses, and image buttons, which f.elements excludes by
+  // spec. e.type covers <button type=""> — any invalid value is a submit button
+  // per the spec, and HTMLButtonElement.type reports "submit" for exactly the
+  // cases an attribute selector sees nothing.
+  const isSubmit = (e) => e.form === f &&
+    (e.tagName === "BUTTON" ? e.type === "submit" : (e.type === "submit" || e.type === "image"));
+  const submits = Array.from(document.querySelectorAll(controls)).filter(isSubmit);
   const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
   return f.action || "";

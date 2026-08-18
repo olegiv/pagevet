@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 )
 
 // The login fixture: a deliberately ordinary session login, so the -login tests
@@ -776,4 +777,82 @@ document.getElementById(%q).addEventListener("submit", async (e) => {
 });
 </script>
 `, LoginFormID, LoginUserField, LoginPassField, LoginFormID))
+}
+
+// loginSlowPost delays its answer past the navigation wait while staying inside
+// a sensible overall budget, so a valid but slow authentication is exercised.
+func (f *fixture) loginSlowPost(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostFormValue(LoginUserField) != LoginUser || r.PostFormValue(LoginPassField) != LoginPass {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		time.Sleep(3 * time.Second)
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, loginForm("/login-slowpost", ""))
+}
+
+// loginTypelessButton uses <button type=""> as its submitter. An invalid type
+// value makes it a submit button per the HTML spec, but an attribute selector
+// for type="submit" — or for an absent attribute — matches nothing.
+func (f *fixture) loginTypelessButton(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		okCreds := r.PostFormValue(LoginUserField) == LoginUser &&
+			r.PostFormValue(LoginPassField) == LoginPass
+		if !okCreds || r.PostFormValue(LoginOpField) != LoginOpValue {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, "<p>missing submitter or bad credentials</p>")
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-typelessbutton">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <button type="" name=%q value=%q>Sign in</button>
+</form>
+`, LoginFormID, LoginUserField, LoginPassField, LoginOpField, LoginOpValue))
+}
+
+// loginDisabledFieldset puts a matching control inside <fieldset disabled>
+// ahead of the usable one. Its own .disabled property is false, but HTML treats
+// it as disabled for focus and omits it from the submission.
+func (f *fixture) loginDisabledFieldset(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		f.loginSubmit(w, r)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-disabledfieldset">
+  <fieldset disabled>
+    <input type="text" name=%q>
+    <input type="password" name=%q>
+  </fieldset>
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField, LoginUserField, LoginPassField))
 }

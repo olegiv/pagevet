@@ -162,7 +162,11 @@ func parseFile(path string) (map[string]string, error) {
 		return nil, fmt.Errorf("%w: %s is not valid UTF-8", ErrConfig, display(path))
 	}
 
-	return parse(string(data), path)
+	// A UTF-8 BOM is valid UTF-8 and survives TrimSpace, so leaving it turns
+	// the first key into "\ufeffLOGIN_PATH" and rejects an otherwise correct
+	// file as missing that key. Editors on Windows write one by default.
+	// internal/input strips it from the URL list for the same reason.
+	return parse(strings.TrimPrefix(string(data), "\ufeff"), path)
 }
 
 // parse turns the file body into key/value pairs.

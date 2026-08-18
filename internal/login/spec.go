@@ -253,20 +253,41 @@ func (s Spec) Describe(redactedURL string) string {
 // Scheme, host and path survive, which is what a user needs to spot the typo.
 func safeURLPreview(raw string) string {
 	s := raw
-	if i := strings.Index(s, "//"); i >= 0 {
-		rest := s[i+2:]
-		// Userinfo ends at the first '@' BEFORE the first '/', so a '@' in the
-		// path is left alone.
-		if at := strings.IndexByte(rest, '@'); at >= 0 {
-			if slash := strings.IndexByte(rest, '/'); slash < 0 || at < slash {
-				s = s[:i+2] + rest[at+1:]
-			}
+
+	// Userinfo is scrubbed whether or not the URL has an authority component.
+	// url.Parse accepts "https:user:hunter2@example.test/login" as an OPAQUE
+	// URL — no "//" anywhere — and a scrub keyed to "//" walked straight past
+	// it, putting the password on stderr. So the search starts after the scheme
+	// separator and does not require the slashes.
+	start := 0
+	if colon := strings.IndexByte(s, ':'); colon >= 0 {
+		start = colon + 1
+	}
+	start += len(leadingSlashes(s[start:]))
+
+	rest := s[start:]
+	// Userinfo ends at the first '@' BEFORE the first '/', so an '@' in the
+	// path is left alone.
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		if slash := strings.IndexByte(rest, '/'); slash < 0 || at < slash {
+			s = s[:start] + rest[at+1:]
 		}
 	}
 	if q := strings.IndexByte(s, '?'); q >= 0 {
 		s = s[:q] + "?..."
 	}
 	return strconv.Quote(clip(s))
+}
+
+// leadingSlashes returns the run of '/' at the start of s, so the userinfo
+// search can skip an authority's "//" when there is one and skip nothing when
+// there is not.
+func leadingSlashes(s string) string {
+	i := 0
+	for i < len(s) && s[i] == '/' {
+		i++
+	}
+	return s[:i]
 }
 
 // parseReason extracts the reason from a *url.Error without its URL field,

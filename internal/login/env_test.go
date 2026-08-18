@@ -521,3 +521,18 @@ func TestParseKeepsBackslashBeforeApostrophe(t *testing.T) {
 		t.Errorf("parse()[K] = %q, want %q", got, want)
 	}
 }
+
+// TestReadFileStripsUTF8BOM is a Windows-editor regression: a BOM is valid
+// UTF-8 and survives TrimSpace, so it became part of the first key and the
+// otherwise correct file was rejected as missing LOGIN_PATH.
+func TestReadFileStripsUTF8BOM(t *testing.T) {
+	t.Parallel()
+
+	c, err := ReadFile(writeEnv(t, "\ufeff"+validEnv), nil)
+	if err != nil {
+		t.Fatalf("ReadFile() on a BOM-prefixed file error = %v", err)
+	}
+	if c.LoginPath != "/login" {
+		t.Errorf("LoginPath = %q, want %q", c.LoginPath, "/login")
+	}
+}

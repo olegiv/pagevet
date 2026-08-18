@@ -925,3 +925,51 @@ func TestLogin_SessionStorageIsNotASession(t *testing.T) {
 		t.Errorf("error = %v, want it to wrap ErrLoginFailed", err)
 	}
 }
+
+// TestLogin_SlowAuthenticationIsNotRejected covers a POST that answers well
+// after the navigation wait gave up but comfortably inside the overall budget.
+//
+// Reading the verdict once meant checking a document that had simply not caught
+// up yet, so a valid sign-in was reported as exit 5.
+func TestLogin_SlowAuthenticationIsNotRejected(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-slowpost") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; a slow but valid authentication was rejected", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_TypelessButtonIsASubmitter covers <button type="">. An invalid type
+// value is a submit button per the HTML spec, but matches neither type="submit"
+// nor "no type attribute".
+func TestLogin_TypelessButtonIsASubmitter(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-typelessbutton") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the typeless button was not recognized as the submitter", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_SkipsControlsInADisabledFieldset covers a matching control inside
+// <fieldset disabled> sitting ahead of the usable one. Its own .disabled is
+// false, so a check on that property picks it — and the credential lands in a
+// control the request never carries.
+func TestLogin_SkipsControlsInADisabledFieldset(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-disabledfieldset") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; a control inside a disabled fieldset was probably filled", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}

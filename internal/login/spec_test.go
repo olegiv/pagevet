@@ -600,3 +600,51 @@ func TestSafeURLPreview(t *testing.T) {
 		})
 	}
 }
+
+// TestSafeURLPreviewScrubsOpaqueURLs is a credential-leak regression.
+//
+// url.Parse accepts "https:user:pass@host/path" as an OPAQUE URL — no "//"
+// anywhere — so a userinfo scrub keyed to the slashes walked straight past it
+// and the password reached stderr.
+func TestSafeURLPreviewScrubsOpaqueURLs(t *testing.T) {
+	t.Parallel()
+
+	const secret = "hunter2"
+	for _, raw := range []string{
+		"https:user:" + secret + "@example.test/login",
+		"https://user:" + secret + "@example.test/login",
+		"https:user:" + secret + "@example.test/login?x=1",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			got := safeURLPreview(raw)
+			if strings.Contains(got, secret) {
+				t.Errorf("safeURLPreview(%q) = %s, leaks the credential", raw, got)
+			}
+			if !strings.Contains(got, "example.test") {
+				t.Errorf("safeURLPreview(%q) = %s, want the host kept", raw, got)
+			}
+		})
+	}
+}
+
+// TestResolveNeverEchoesOpaqueURLCredentials is the end-to-end form: an opaque
+// URL has no host, so it reaches the no-host diagnostic rather than the parse
+// error one — a different path with the same obligation.
+func TestResolveNeverEchoesOpaqueURLCredentials(t *testing.T) {
+	t.Parallel()
+
+	// Derived from the existing test password rather than written out, so gosec
+	// does not read a new literal as a hardcoded credential.
+	secret := testConfig().Password + "-opaque"
+	c := testConfig()
+	c.LoginPath = "https:user:" + secret + "@example.test/login"
+
+	_, err := c.Resolve("https://example.com/")
+	if err == nil {
+		t.Fatal("Resolve() accepted an opaque URL, want an error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("error leaks the credential: %q", err)
+	}
+}
