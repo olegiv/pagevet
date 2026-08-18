@@ -224,27 +224,46 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 
 	// Choose and validate each control, then act on the element that was
 	// chosen rather than re-running a selector that might resolve elsewhere.
-	if markErr := b.markCredentialField(ctx, "username", spec.FormID, spec.UserField); markErr != nil {
+	//
+	// A field that was never marked is reported HERE rather than being left to
+	// the fill below. markCredentialField only comes back empty-handed when its
+	// deadline expired, so letting the fill speak for it spent that budget a
+	// second time to reach the same place - and phrased the answer as "there is
+	// no such field", which is a claim about the .env that a slow page had not
+	// earned.
+	foundUser, markErr := b.markCredentialField(ctx, "username", spec.FormID, spec.UserField)
+	if markErr != nil {
 		return markErr
+	}
+	if !foundUser {
+		return fmt.Errorf("%w: no username field named %q in %s after %s. "+
+			"Check USERNAME_NAME, or the page was too slow",
+			ErrLoginFailed, spec.UserField, formLabel, b.findTimeout())
 	}
 	markedUser := "[" + fieldMarker + "]"
 
 	// Fill both fields. Errors below name the SELECTOR, never the value.
 	switch timedOut, findErr := b.runFind(ctx, b.fillField(markedUser, spec.Username)); {
 	case timedOut:
-		return fmt.Errorf("%w: %s has no field named %q. Check USERNAME_NAME",
-			ErrLoginFailed, formLabel, spec.UserField)
+		return fmt.Errorf("%w: the username field %q in %s was marked but could not be filled within %s",
+			ErrLoginFailed, spec.UserField, formLabel, b.findTimeout())
 	case findErr != nil:
 		return fmt.Errorf("%w: filling the username field %s: %w", ErrLoginFailed, userSel, findErr)
 	}
 
-	if markErr := b.markCredentialField(ctx, "password", spec.FormID, spec.PassField); markErr != nil {
+	foundPass, markErr := b.markCredentialField(ctx, "password", spec.FormID, spec.PassField)
+	if markErr != nil {
 		return markErr
+	}
+	if !foundPass {
+		return fmt.Errorf("%w: no password field named %q in %s after %s. "+
+			"Check PASSWORD_NAME, or the page was too slow",
+			ErrLoginFailed, spec.PassField, formLabel, b.findTimeout())
 	}
 	switch timedOut, findErr := b.runFind(ctx, b.fillField("["+fieldMarker+"]", spec.Password)); {
 	case timedOut:
-		return fmt.Errorf("%w: %s has no field named %q. Check PASSWORD_NAME",
-			ErrLoginFailed, formLabel, spec.PassField)
+		return fmt.Errorf("%w: the password field %q in %s was marked but could not be filled within %s",
+			ErrLoginFailed, spec.PassField, formLabel, b.findTimeout())
 	case findErr != nil:
 		return fmt.Errorf("%w: filling the password field %s: %w", ErrLoginFailed, passSel, findErr)
 	}
@@ -452,10 +471,17 @@ const jsMarkField = `function (formID, name, marker) {
 
 // markCredentialField chooses the control for one credential, stamps it, and
 // refuses anything a credential must not be typed into.
-func (b *Browser) markCredentialField(ctx context.Context, what, formID, name string) error {
+//
+// found is false ONLY because the deadline below expired: the poll has no other
+// way out with an empty kind, since it either breaks on a non-empty result or
+// runs until stepCtx is done. That distinction is the caller's to report, and
+// it is not cosmetic - "there is no field named X" is a claim about the .env,
+// while "nothing appeared within 5s" is a claim about the page. Returning nil
+// here for both is what let a starved browser be reported as a misconfiguration.
+func (b *Browser) markCredentialField(ctx context.Context, what, formID, name string) (found bool, err error) {
 	expr, err := jsCall(jsMarkField, formID, name, fieldMarker)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Poll rather than ask once. A form shell can commit before hydration adds
@@ -472,7 +498,7 @@ func (b *Browser) markCredentialField(ctx context.Context, what, formID, name st
 			if stepCtx.Err() != nil && ctx.Err() == nil {
 				break // deadline: fall through to the empty-kind path below
 			}
-			return fmt.Errorf("%w: inspecting the %s field: %w", ErrLoginFailed, what, err)
+			return false, fmt.Errorf("%w: inspecting the %s field: %w", ErrLoginFailed, what, err)
 		}
 		if kind != "" {
 			break
@@ -484,16 +510,16 @@ func (b *Browser) markCredentialField(ctx context.Context, what, formID, name st
 
 	switch {
 	case kind == "":
-		return nil // never appeared; the fill below reports it properly
+		return false, nil // the deadline expired; the caller says so
 	case kind == "input:file":
-		return fmt.Errorf("%w: the %s field is a file input. Refusing to enter credentials: "+
+		return false, fmt.Errorf("%w: the %s field is a file input. Refusing to enter credentials: "+
 			"typing into one uploads a LOCAL FILE named by the value instead of entering it",
 			ErrLoginFailed, what)
 	case !textCapable[kind]:
-		return fmt.Errorf("%w: the %s field is a %s, which cannot hold a typed credential. "+
+		return false, fmt.Errorf("%w: the %s field is a %s, which cannot hold a typed credential. "+
 			"Check the name in .env", ErrLoginFailed, what, kind)
 	}
-	return nil
+	return true, nil
 }
 
 // fillField types value into the field at sel, REPLACING whatever is there.

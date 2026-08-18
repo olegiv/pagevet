@@ -690,6 +690,20 @@ func TestLogin_UnknownFieldFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "not_a_field") {
 		t.Errorf("error = %q, want it to name the field it looked for", err)
 	}
+	// The message must read as a TIMEOUT, not as a verdict on the .env.
+	//
+	// markCredentialField gives up only when its deadline expires, so this same
+	// path is what a browser too starved to answer in time also takes - and for
+	// a while it told that user their USERNAME_NAME was wrong when it was not.
+	// Naming the budget is what separates "no such field" from "nothing
+	// answered in 5s"; asserting it here stops the message regressing to the
+	// bare claim.
+	if !strings.Contains(err.Error(), "after") {
+		t.Errorf("error = %q, want it to say how long it looked", err)
+	}
+	if strings.Contains(err.Error(), "has no field named") {
+		t.Errorf("error = %q, states absence as fact; a timeout has not earned that", err)
+	}
 }
 
 func TestLogin_UnreachableLoginPageFails(t *testing.T) {
