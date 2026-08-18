@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,6 +21,33 @@ import (
 	"github.com/olegiv/pagevet/internal/report"
 	"github.com/olegiv/pagevet/internal/verdict"
 )
+
+// crawlHosts is the deduplicated set of hosts the run will visit.
+//
+// Browser.Login needs it to tell a session the crawl can USE from one it
+// merely observed: a cookie set for auth.example, or a token in that origin's
+// storage, is invisible to a crawl of app.example, and accepting it would send
+// the whole run out anonymous while reporting a sign-in.
+func crawlHosts(entries []input.Entry) []string {
+	seen := make(map[string]struct{}, len(entries))
+	hosts := make([]string, 0, 8)
+	for _, e := range entries {
+		u, err := url.Parse(e.URL)
+		if err != nil {
+			continue // internal/input already accepted it; nothing to add here
+		}
+		h := strings.ToLower(u.Hostname())
+		if h == "" {
+			continue
+		}
+		if _, dup := seen[h]; dup {
+			continue
+		}
+		seen[h] = struct{}{}
+		hosts = append(hosts, h)
+	}
+	return hosts
+}
 
 // displayURL applies the run's redaction policy to a URL bound for a log file
 // or the terminal. The crawler does this to every URL it reports; the login URL
@@ -173,6 +202,7 @@ func run(ctx context.Context, cfg Config, newLoader newBrowser, stdout, stderr i
 	opts.ConsoleWarnings = cfg.ConsoleWarnings
 	opts.RedactURLs = !cfg.LogFullURLs
 	opts.Login = loginSpec
+	opts.CrawlHosts = crawlHosts(parsed.Entries)
 	// The loader re-runs this against the page that actually commits, because a
 	// login page may redirect somewhere the pre-flight check never saw.
 	opts.CheckHost = func(ctx context.Context, host string) error {

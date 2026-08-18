@@ -381,9 +381,11 @@ about unchecked `fmt.Fprintf` and `gosec` in test files.
    filled — but a 307 or 308 answer to the POST itself preserves the method and body, and Chrome follows it
    before pagevet regains control. The run then fails loudly and says the credentials may have travelled,
    which is detection, not prevention. Preventing it needs CDP request interception, vetting every request
-   before Chrome sends it. As with the address guard generally: this is defence in depth against an accident
-   in your own `.env`, not a boundary against a login page written by an attacker. Point `-login` at sites
-   you control.
+   before Chrome sends it. The same gap is wider for a form that submits into another tab or frame
+   (`target="_blank"`, an iframe): pagevet reads the outcome from the tab it drove, so a redirect that
+   happens in the destination context is invisible to it entirely. As with the address guard generally: this
+   is defence in depth against an accident in your own `.env`, not a boundary against a login page written
+   by an attacker. Point `-login` at sites you control.
 9. **A failed login can satisfy both success signals.** The common post/redirect/get failure — wrong
    credentials, the server rotates a flash or session cookie and redirects to a dedicated error page that
    carries no login form — changes the session state *and* removes the form, which is everything `-login`

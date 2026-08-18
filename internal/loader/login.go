@@ -250,14 +250,11 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	}
 
 	// submit builds its own message, including the ErrLoginFailed wrapper.
-	// Ask BEFORE submitting, while the form is still in the document to be
-	// asked about.
-	targeted, targetErr := b.submitTargetsElsewhere(ctx, spec.FormID)
-	if targetErr != nil {
-		return targetErr
-	}
-
-	navigated, submitErr := b.submit(ctx, formLabel, spec.FormID)
+	// targeted comes back from submit rather than being read here, because
+	// submit re-selects the control after the fields are filled — a handler
+	// that enables a different button can change which formtarget applies, and
+	// a verdict computed from the stale choice inspects the wrong context.
+	navigated, targeted, submitErr := b.submit(ctx, formLabel, spec.FormID)
 	if submitErr != nil {
 		return submitErr
 	}
@@ -321,7 +318,7 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		if err != nil {
 			return fmt.Errorf("%w: reading the session state after submit: %w", ErrLoginFailed, err)
 		}
-		changed = after.changedSince(before)
+		changed = after.changedSince(before, b.opts.CrawlHosts)
 
 		formGone, err = formAbsent(ctx, spec.FormID)
 		if err != nil {
@@ -461,16 +458,33 @@ func (b *Browser) markCredentialField(ctx context.Context, what, formID, name st
 		return err
 	}
 
-	var kind string
+	// Poll rather than ask once. A form shell can commit before hydration adds
+	// its inputs, and a single look would come back empty — after which the
+	// fill waits on the MARKER, which nothing carries, so a field that appeared
+	// a moment later was never marked and the sign-in timed out inside a budget
+	// that had plenty left.
 	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
 	defer cancel()
-	if err := chromedp.Run(stepCtx, chromedp.Evaluate(expr, &kind)); err != nil {
-		return fmt.Errorf("%w: inspecting the %s field: %w", ErrLoginFailed, what, err)
+
+	var kind string
+	for {
+		if err := chromedp.Run(stepCtx, chromedp.Evaluate(expr, &kind)); err != nil {
+			if stepCtx.Err() != nil && ctx.Err() == nil {
+				break // deadline: fall through to the empty-kind path below
+			}
+			return fmt.Errorf("%w: inspecting the %s field: %w", ErrLoginFailed, what, err)
+		}
+		if kind != "" {
+			break
+		}
+		if !sleepWithin(stepCtx, verdictPollInterval) {
+			break
+		}
 	}
 
 	switch {
 	case kind == "":
-		return nil // not there yet; the fill below reports it properly
+		return nil // never appeared; the fill below reports it properly
 	case kind == "input:file":
 		return fmt.Errorf("%w: the %s field is a file input. Refusing to enter credentials: "+
 			"typing into one uploads a LOCAL FILE named by the value instead of entering it",
@@ -571,13 +585,13 @@ const submitMarker = "data-pagevet-submit"
 // reported exit 5 on a sign-in that had plainly worked. When no navigation
 // arrives, the cookie and form checks in doLogin are left to judge the outcome
 // — which is what they are for.
-func (b *Browser) submit(ctx context.Context, formLabel, formID string) (navigated bool, err error) {
+func (b *Browser) submit(ctx context.Context, formLabel, formID string) (navigated, targeted bool, err error) {
 	// Re-mark rather than trusting the earlier pass: filling the fields can run
 	// page script that enables a previously disabled button, which is a common
 	// "enable Sign in once both fields are non-empty" pattern.
 	clickable, err := b.markClickableSubmit(ctx, formID)
 	if err != nil {
-		return false, fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
+		return false, false, fmt.Errorf("%w: looking for the submit control of %s: %w", ErrLoginFailed, formLabel, err)
 	}
 
 	// The destination was checked before the fields were filled, but the
@@ -587,12 +601,18 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) (navigat
 	// own formaction — so the target is re-checked against the FINAL selection,
 	// immediately before anything is dispatched.
 	if destErr := b.checkSubmitDestination(ctx, formLabel, formID); destErr != nil {
-		return false, destErr
+		return false, false, destErr
+	}
+
+	// Read the target from the control just chosen, before dispatching.
+	targeted, err = b.submitTargetsElsewhere(ctx, formID)
+	if err != nil {
+		return false, false, err
 	}
 
 	submitExpr, err := jsCall(jsRequestSubmit, formID, submitMarker, submitControls)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	how := "calling requestSubmit() on it"
@@ -611,19 +631,19 @@ func (b *Browser) submit(ctx context.Context, formLabel, formID string) (navigat
 	if _, err := chromedp.RunResponse(waitCtx, action); err != nil {
 		switch {
 		case ctx.Err() != nil:
-			return false, fmt.Errorf("%w: submitting %s by %s: %w", ErrLoginFailed, formLabel, how, err)
+			return false, targeted, fmt.Errorf("%w: submitting %s by %s: %w", ErrLoginFailed, formLabel, how, err)
 		case waitCtx.Err() != nil:
 			// No navigation within the window. Either the page authenticated
 			// without one — a slow POST, or an SPA that never navigates at all
 			// — or nothing happened. doLogin's checks tell those apart, and
 			// re-sending the credentials is never the answer.
-			return false, nil
+			return false, targeted, nil
 		default:
-			return false, fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
+			return false, targeted, fmt.Errorf("%w: submitting %s by %s: %w (the credentials may already have been "+
 				"sent; pagevet will not submit them a second time)", ErrLoginFailed, formLabel, how, err)
 		}
 	}
-	return true, nil
+	return true, targeted, nil
 }
 
 // markClickableSubmit finds the first submit control that could actually be
@@ -761,7 +781,17 @@ var jsSubmitTargetsElsewhere = `function (formID, marker, controls) {
   if (!f) return false;
 ` + jsSubmitsOf + `  const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   const t = (c && c.hasAttribute("formtarget") ? c.getAttribute("formtarget") : f.getAttribute("target")) || "";
-  return t !== "" && t !== "_self";
+  if (t === "") return false;
+  // Reserved keywords are case-insensitive; a browsing-context NAME is not.
+  const kw = t.toLowerCase();
+  if (kw === "_self") return false;
+  // In a top-level tab _top and _parent both resolve to this tab, so a form
+  // aimed at either lands right back here and its form-gone signal is as
+  // meaningful as any other.
+  if (kw === "_top" && window.top === window) return false;
+  if (kw === "_parent" && window.parent === window) return false;
+  if (window.name !== "" && t === window.name) return false;
+  return true;
 }`
 
 // submitTargetsElsewhere reports whether submitting this form sends its answer
@@ -896,14 +926,77 @@ func (b *Browser) takeSnapshot(ctx context.Context) (snapshot, error) {
 // changed, between two snapshots.
 //
 // Storage is compared only when the origin has not moved; see snapshot.origin.
-func (s snapshot) changedSince(before snapshot) []string {
-	changed := changedNames(before.cookies, s.cookies)
-	if s.origin != "" && s.origin == before.origin {
-		changed = append(changed, changedNames(before.storage, s.storage)...)
-		slices.Sort(changed)
-		changed = slices.Compact(changed)
+func (s snapshot) changedSince(before snapshot, crawl []string) []string {
+	var changed []string
+	for _, key := range changedKeys(before.cookies, s.cookies) {
+		// A cookie only counts if a crawl tab would actually send it. A
+		// successful sign-in at auth.example that sets an auth.example cookie
+		// proves nothing about a crawl of app.example — those requests carry
+		// none of it, and the run would go out anonymous believing otherwise.
+		if cookieReachesAny(cookieDomain(key), crawl) {
+			changed = append(changed, entryName(key))
+		}
 	}
-	return changed
+	if s.origin != "" && s.origin == before.origin && originServesAny(s.origin, crawl) {
+		// Storage is per-origin, so it is evidence only when the crawl visits
+		// the origin that holds it.
+		for _, key := range changedKeys(before.storage, s.storage) {
+			changed = append(changed, entryName(key))
+		}
+	}
+	slices.Sort(changed)
+	return slices.Compact(changed)
+}
+
+// cookieDomain recovers the domain from a cookie snapshot key.
+func cookieDomain(key string) string {
+	_, rest, _ := strings.Cut(key, "\x00")
+	domain, _, _ := strings.Cut(rest, "/")
+	return domain
+}
+
+// cookieReachesAny reports whether a cookie of that domain would be sent to any
+// of the hosts the crawl will visit.
+//
+// The rule is the cookie domain-match from RFC 6265: an exact host match, or a
+// host that is a subdomain of the cookie's domain. A leading dot is historical
+// syntax for the same thing.
+//
+// With no crawl hosts known — which is only the case in tests — nothing is
+// filtered, since a filter that rejects everything would be worse than none.
+func cookieReachesAny(domain string, crawl []string) bool {
+	if len(crawl) == 0 {
+		return true
+	}
+	d := strings.ToLower(strings.TrimPrefix(domain, "."))
+	if d == "" {
+		return true // no domain recorded: do not silently discard the evidence
+	}
+	for _, host := range crawl {
+		h := strings.ToLower(host)
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// originServesAny reports whether the crawl visits the host of that origin.
+func originServesAny(origin string, crawl []string) bool {
+	if len(crawl) == 0 {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, c := range crawl {
+		if strings.EqualFold(c, host) {
+			return true
+		}
+	}
+	return false
 }
 
 // jsStorageSnapshot returns the page's origin and its localStorage entries.
@@ -927,8 +1020,8 @@ const jsStorageSnapshot = `function () {
   return { origin: window.location.origin, entries: out };
 }`
 
-// changedNames returns the names of entries that appeared, or whose value
-// changed, between the two snapshots.
+// changedKeys returns the snapshot keys of entries that appeared, or whose
+// value changed, between the two snapshots.
 //
 // A NEW NAME is not required, and that is the point. The obvious flow — the
 // login page hands out an anonymous session cookie, the POST authenticates that
@@ -937,11 +1030,15 @@ const jsStorageSnapshot = `function () {
 // sites outright. Any server that upgrades a session in place still rotates the
 // identifier, because not rotating it is session fixation, so the value change
 // is the signal that actually generalizes.
-func changedNames(before, after map[string]string) []string {
+func changedKeys(before, after map[string]string) []string {
 	var changed []string
 	for key, digest := range after {
 		if old, existed := before[key]; !existed || old != digest {
-			changed = append(changed, entryName(key))
+			// KEYS, not display names. The caller has to read the domain out of
+			// the key to decide whether the crawl could use this cookie at all;
+			// collapsing to the name here threw that away and let every cookie
+			// through the filter.
+			changed = append(changed, key)
 		}
 	}
 	slices.Sort(changed)

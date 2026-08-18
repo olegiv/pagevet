@@ -184,7 +184,7 @@ func TestEvaluatedJSIsConstant(t *testing.T) {
 	}
 }
 
-func TestChangedNames(t *testing.T) {
+func TestChangedKeys(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -196,7 +196,7 @@ func TestChangedNames(t *testing.T) {
 			name:   "a brand new cookie",
 			before: map[string]string{},
 			after:  map[string]string{"SSESS\x00.example.com/": "aaaa"},
-			want:   []string{"SSESS"},
+			want:   []string{"SSESS\x00.example.com/"},
 		},
 		{
 			// THE regression: a PHP/Express flow where the login page hands out
@@ -205,7 +205,7 @@ func TestChangedNames(t *testing.T) {
 			name:   "same name, rotated value",
 			before: map[string]string{"PHPSESSID\x00.example.com/": "aaaa"},
 			after:  map[string]string{"PHPSESSID\x00.example.com/": "bbbb"},
-			want:   []string{"PHPSESSID"},
+			want:   []string{"PHPSESSID\x00.example.com/"},
 		},
 		{
 			name:   "nothing changed",
@@ -220,7 +220,8 @@ func TestChangedNames(t *testing.T) {
 			want:   nil,
 		},
 		{
-			// Same name on two hosts must not mask one another.
+			// Keys carry the domain, so the same name on two hosts stays two
+			// entries — which is what lets the caller filter by reachability.
 			name: "same name, different domain",
 			before: map[string]string{
 				"sid\x00.a.example/": "aaaa",
@@ -229,7 +230,7 @@ func TestChangedNames(t *testing.T) {
 				"sid\x00.a.example/": "aaaa",
 				"sid\x00.b.example/": "cccc",
 			},
-			want: []string{"sid"},
+			want: []string{"sid\x00.b.example/"},
 		},
 	}
 
@@ -237,15 +238,34 @@ func TestChangedNames(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := changedNames(tt.before, tt.after)
+			got := changedKeys(tt.before, tt.after)
 			if len(got) != len(tt.want) {
-				t.Fatalf("changedNames() = %v, want %v", got, tt.want)
+				t.Fatalf("changedKeys() = %q, want %q", got, tt.want)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Errorf("changedNames() = %v, want %v", got, tt.want)
+					t.Errorf("changedKeys() = %q, want %q", got, tt.want)
 					break
 				}
+			}
+		})
+	}
+}
+
+func TestCookieDomain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ key, want string }{
+		{"sid\x00.example.com/", ".example.com"},
+		{"sid\x00app.example/", "app.example"},
+		{"sid\x00app.example/admin", "app.example"},
+		{"bare", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			t.Parallel()
+			if got := cookieDomain(tt.key); got != tt.want {
+				t.Errorf("cookieDomain(%q) = %q, want %q", tt.key, got, tt.want)
 			}
 		})
 	}
@@ -353,6 +373,7 @@ func TestSnapshotChangedSince(t *testing.T) {
 	tests := []struct {
 		name          string
 		before, after snapshot
+		crawl         []string
 		want          []string
 	}{
 		{
@@ -399,7 +420,7 @@ func TestSnapshotChangedSince(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := tt.after.changedSince(tt.before)
+			got := tt.after.changedSince(tt.before, tt.crawl)
 			if len(got) != len(tt.want) {
 				t.Fatalf("changedSince() = %v, want %v", got, tt.want)
 			}
@@ -493,5 +514,93 @@ func TestSubmitPredicateIsSharedNotCopied(t *testing.T) {
 		if !strings.Contains(jsSubmitsOf, want) {
 			t.Errorf("jsSubmitsOf lost %q", want)
 		}
+	}
+}
+
+// TestChangedSinceScopesToCrawlHosts is the regression for evidence the crawl
+// cannot use.
+//
+// Signing in at auth.example may set an auth.example cookie or fill that
+// origin's storage. A crawl of app.example neither sends that cookie nor can
+// read that storage, so accepting it as proof sends the whole run out anonymous
+// while reporting a session — the exact failure -login exists to prevent.
+func TestChangedSinceScopesToCrawlHosts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		before, after snapshot
+		crawl         []string
+		want          []string
+	}{
+		{
+			name:   "cookie for the login host only, crawl is elsewhere",
+			before: snapshot{origin: "https://auth.example", cookies: map[string]string{}},
+			after: snapshot{origin: "https://auth.example",
+				cookies: map[string]string{"sid\x00auth.example/": "1"}},
+			crawl: []string{"app.example"},
+			want:  nil,
+		},
+		{
+			name:   "cookie on a parent domain reaches the crawl host",
+			before: snapshot{origin: "https://auth.example.com", cookies: map[string]string{}},
+			after: snapshot{origin: "https://auth.example.com",
+				cookies: map[string]string{"sid\x00.example.com/": "1"}},
+			crawl: []string{"app.example.com"},
+			want:  []string{"sid"},
+		},
+		{
+			name:   "exact host match counts",
+			before: snapshot{origin: "https://app.example", cookies: map[string]string{}},
+			after: snapshot{origin: "https://app.example",
+				cookies: map[string]string{"sid\x00app.example/": "1"}},
+			crawl: []string{"app.example"},
+			want:  []string{"sid"},
+		},
+		{
+			name: "storage is evidence only when the crawl visits that origin",
+			before: snapshot{origin: "https://auth.example", cookies: map[string]string{},
+				storage: map[string]string{}},
+			after: snapshot{origin: "https://auth.example", cookies: map[string]string{},
+				storage: map[string]string{"localStorage:tok\x00": "1"}},
+			crawl: []string{"app.example"},
+			want:  nil,
+		},
+		{
+			name: "storage counts when the crawl visits the login origin",
+			before: snapshot{origin: "https://app.example", cookies: map[string]string{},
+				storage: map[string]string{}},
+			after: snapshot{origin: "https://app.example", cookies: map[string]string{},
+				storage: map[string]string{"localStorage:tok\x00": "1"}},
+			crawl: []string{"app.example"},
+			want:  []string{"localStorage:tok"},
+		},
+		{
+			// No hosts known happens only in tests; filtering everything out
+			// would be worse than not filtering.
+			name:   "no crawl hosts means no filtering",
+			before: snapshot{origin: "https://auth.example", cookies: map[string]string{}},
+			after: snapshot{origin: "https://auth.example",
+				cookies: map[string]string{"sid\x00auth.example/": "1"}},
+			crawl: nil,
+			want:  []string{"sid"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tt.after.changedSince(tt.before, tt.crawl)
+			if len(got) != len(tt.want) {
+				t.Fatalf("changedSince() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("changedSince() = %v, want %v", got, tt.want)
+					break
+				}
+			}
+		})
 	}
 }

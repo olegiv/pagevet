@@ -128,6 +128,16 @@ type Options struct {
 	// internal/input, and the loader has no business owning it or importing it.
 	CheckHost func(ctx context.Context, host string) error
 
+	// CrawlHosts are the hosts the run will actually visit. Empty means "no
+	// opinion", which is only the case in tests.
+	//
+	// Browser.Login uses them to decide whether the state a sign-in changed is
+	// state the CRAWL can use. A cookie set for auth.example, or a token in
+	// auth.example's localStorage, proves nothing about a crawl of app.example:
+	// those tabs neither send that cookie nor can read that storage, and a run
+	// that accepted it would go out anonymous while reporting a session.
+	CrawlHosts []string
+
 	// Login, when non-nil, is the form and account Browser.Login signs in with.
 	// Nil disables authentication entirely and is the default; Login returns an
 	// error rather than silently succeeding if it is called with no spec.
