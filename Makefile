@@ -6,18 +6,81 @@
 BIN     := pagevet
 PKG     := github.com/olegiv/pagevet
 LOADER  := $(PKG)/internal/loader
+DIST    := dist
 
-.PHONY: all build clean fmt vet tidy arch test test-e2e lint sec vuln vuln-module check help
+# Release stamping, consumed by the -X flags below.
+#
+# `:=`, not `?=`. A `?=` variable is recursively expanded, so its $(shell) re-runs
+# at every reference: eight subprocesses across build-all-platforms, and a `date`
+# that can straddle a second boundary and stamp two binaries from the same run
+# differently. `make build-prod COMMIT=deadbee` still overrides either way,
+# because a command-line variable beats any assignment in this file.
+COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE    := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+# -s -w drop the symbol table and DWARF: roughly a third off the binary, and
+# nothing here reads either at runtime. -X patches internal/app's Version block,
+# which is why those three are `var` and not `const` - the linker silently
+# ignores an -X aimed at a constant, and a stamp that fails quietly is worse
+# than no stamp at all.
+LDFLAGS_PROD := -s -w \
+    -X $(PKG)/internal/app.Commit=$(COMMIT) \
+    -X $(PKG)/internal/app.BuildTime=$(DATE)
+
+# CGO_ENABLED=0 is stated rather than assumed. Every dependency here is pure Go,
+# so it changes nothing about what gets built; it makes the static result a
+# property of this file instead of an accident of whether the cross-compile
+# happened to disable cgo for us.
+define cross_build
+@mkdir -p $(DIST)
+CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -trimpath -ldflags="$(LDFLAGS_PROD)" -o $(DIST)/$(BIN)-$(1)-$(2) ./cmd/pagevet
+endef
+
+.PHONY: all build build-prod build-linux-amd64 build-linux-arm64 build-darwin-amd64 \
+        build-darwin-arm64 build-all-platforms clean fmt vet tidy arch test test-e2e \
+        lint sec vuln vuln-module check help
 
 all: build
 
 ## build: compile the binary into ./pagevet
+##
+## Unoptimised on purpose - this is the binary `make check` builds, and a
+## debugger needs the symbol table and DWARF that build-prod strips.
 build:
 	go build -o $(BIN) ./cmd/pagevet
+
+## build-prod: optimised, version-stamped ./pagevet
+build-prod:
+	go build -trimpath -ldflags="$(LDFLAGS_PROD)" -o $(BIN) ./cmd/pagevet
+
+## build-linux-amd64: release binary into dist/
+build-linux-amd64:
+	$(call cross_build,linux,amd64)
+
+## build-linux-arm64: release binary into dist/
+build-linux-arm64:
+	$(call cross_build,linux,arm64)
+
+## build-darwin-amd64: release binary into dist/
+build-darwin-amd64:
+	$(call cross_build,darwin,amd64)
+
+## build-darwin-arm64: release binary into dist/
+build-darwin-arm64:
+	$(call cross_build,darwin,arm64)
+
+## build-all-platforms: every release binary above, into dist/
+##
+## No Windows target. It would compile, but ResolveChromePath probes only the
+## macOS app bundles and the Linux $PATH names, so the binary could never find
+## a browser without -chrome on every single run.
+build-all-platforms: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64
+	@ls -lh $(DIST)/$(BIN)-*
 
 ## clean: remove build and coverage artifacts
 clean:
 	rm -f $(BIN) coverage.out coverage.e2e.out cover.html
+	rm -rf $(DIST)
 
 ## fmt: fail if anything is unformatted (gofmt exits 0 even when it lists files)
 fmt:

@@ -3,6 +3,7 @@
 
 # Build output
 /pagevet
+/dist/
 
 # Default -out directory: crawl results contain the URLs you supplied,
 # credentials and all. Never commit them.

@@ -330,6 +330,29 @@ make test      # fast tests, no Chrome, ~seconds
 make test-e2e  # includes the tests that drive real Chrome
 ```
 
+Shipping a build rather than testing one:
+
+```sh
+make build-prod           # optimised, version-stamped ./pagevet
+make build-all-platforms  # linux and darwin, amd64 and arm64, into dist/
+```
+
+`build-prod` and the cross-compiled targets are stripped (`-s -w`), built with
+`-trimpath`, and stamped by the linker with the git commit and the UTC build time,
+so `-version` on a release binary reports which build it is:
+
+```
+$ ./pagevet -version
+pagevet 0.1.0 (a1b2c3d, 2026-08-18T09:54:00Z)
+```
+
+Plain `make build` and the `go build` in [Install](#install) pass no `-X` flags,
+so they print `pagevet 0.1.0` and keep their symbol table and DWARF — which is
+what a debugger and a readable panic trace need. There is no Windows target:
+it would compile, but Chrome autodetection probes only the macOS app bundles
+and the Linux `$PATH` names, so such a binary could never find a browser
+without `-chrome` on every run.
+
 Browser-dependent tests are gated by the `PAGEVET_E2E=1` environment variable rather than a build tag.
 Files behind `//go:build e2e` are invisible to `go test ./...`, `go vet` and `golangci-lint`, so they rot
 silently; with an env var they always type-check and only the body skips.

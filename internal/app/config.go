@@ -18,8 +18,39 @@ import (
 	"time"
 )
 
-// Version is the reported build version.
-const Version = "0.1.0"
+// Version is the reported build version. Commit and BuildTime are written by
+// the linker at build time - see `make build-prod` - which is why all three are
+// `var` and not `const`: -X patches a package-level string VARIABLE, and aimed
+// at a constant it does nothing and reports nothing.
+//
+// Commit and BuildTime are empty by default rather than "unknown". A plain
+// `go build ./cmd/pagevet` - what README documents, what the e2e test compiles
+// and what `go test` links - then prints exactly what it printed before
+// stamping existed, instead of "pagevet 0.1.0 (unknown, unknown)".
+var (
+	Version   = "0.1.0"
+	Commit    string
+	BuildTime string
+)
+
+// versionLine renders the -version output.
+//
+// It takes its three values as arguments rather than reading the package
+// variables so that both renderings are testable without writing to globals
+// from a test. The parenthetical appears only for the parts the linker actually
+// stamped, so an unstamped build is byte-identical to the pre-stamping output.
+func versionLine(version, commit, buildTime string) string {
+	switch {
+	case commit != "" && buildTime != "":
+		return fmt.Sprintf("pagevet %s (%s, %s)", version, commit, buildTime)
+	case commit != "":
+		return fmt.Sprintf("pagevet %s (%s)", version, commit)
+	case buildTime != "":
+		return fmt.Sprintf("pagevet %s (%s)", version, buildTime)
+	default:
+		return "pagevet " + version
+	}
+}
 
 // Exit codes. The split between 1 and 3 is what makes this usable in CI: a
 // broken URL is a DATA outcome, whereas a browser that would not start is a

@@ -75,7 +75,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return ExitUsage
 	}
 	if cfg.ShowVersion {
-		fmt.Fprintf(stdout, "pagevet %s\n", Version)
+		fmt.Fprintln(stdout, versionLine(Version, Commit, BuildTime))
 		return ExitOK
 	}
 
