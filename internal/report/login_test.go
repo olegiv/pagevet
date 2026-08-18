@@ -147,3 +147,48 @@ func TestLoginHeaderReachesErrorLogs(t *testing.T) {
 		})
 	}
 }
+
+// TestLoginHeaderReachesTextErrorLogs is the text-format counterpart.
+//
+// The login line used to be written only in the opened.log branch, so somebody
+// opening errors-http.log on its own had no way to tell whether those 403s were
+// seen signed in or signed out. The JSON header always carried it everywhere.
+func TestLoginHeaderReachesTextErrorLogs(t *testing.T) {
+	t.Parallel()
+
+	dir := outDir(t)
+	r := newLoginReporter(t, dir, FormatText)
+	emitFixtures(t, r)
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	for _, name := range []string{FileHTTP, FileConsole, FileSubresource, FileLoad} {
+		if !exists(t, dir, name) {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(readFile(t, dir, name), loginNote) {
+				t.Errorf("%s has no login provenance:\n%s", name, readFile(t, dir, name))
+			}
+		})
+	}
+}
+
+// TestNoLoginLineInTextErrorLogsByDefault keeps the goldens honest: an
+// unauthenticated run's error logs must be unchanged.
+func TestNoLoginLineInTextErrorLogsByDefault(t *testing.T) {
+	t.Parallel()
+
+	dir := outDir(t)
+	r := newReporter(t, dir, FormatText, false)
+	emitFixtures(t, r)
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for _, name := range []string{FileHTTP, FileConsole, FileSubresource, FileLoad} {
+		if exists(t, dir, name) && strings.Contains(readFile(t, dir, name), "# login") {
+			t.Errorf("%s carries a login line on an unauthenticated run", name)
+		}
+	}
+}

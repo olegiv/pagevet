@@ -193,9 +193,9 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return err
 	}
 
-	before, err := cookieDigests(ctx)
+	before, err := b.sessionEvidence(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: reading cookies before submit: %w", ErrLoginFailed, err)
+		return fmt.Errorf("%w: reading the session state before submit: %w", ErrLoginFailed, err)
 	}
 
 	switch timedOut, findErr := b.runFind(ctx, chromedp.WaitVisible(formSel, chromedp.ByQuery)); {
@@ -220,6 +220,15 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 	// is typed, not after.
 	if destErr := b.checkSubmitDestination(ctx, formLabel, spec.FormID); destErr != nil {
 		return destErr
+	}
+
+	// Refuse to type into a control that is not text-capable, BEFORE typing.
+	// chromedp.SendKeys turns a file input into a local-file upload.
+	if typErr := b.checkFieldTypable(ctx, "username", userSel); typErr != nil {
+		return typErr
+	}
+	if typErr := b.checkFieldTypable(ctx, "password", passSel); typErr != nil {
+		return typErr
 	}
 
 	// Fill both fields. Errors below name the SELECTOR, never the value.
@@ -265,11 +274,11 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return fmt.Errorf("%w. The credentials may already have reached it", landedErr)
 	}
 
-	after, err := cookieDigests(ctx)
+	after, err := b.sessionEvidence(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: reading cookies after submit: %w", ErrLoginFailed, err)
+		return fmt.Errorf("%w: reading the session state after submit: %w", ErrLoginFailed, err)
 	}
-	changed := changedCookies(before, after)
+	changed := changedNames(before, after)
 
 	formGone, err := formAbsent(ctx, spec.FormID)
 	if err != nil {
@@ -306,6 +315,67 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 func fieldSelector(formID, fieldName string) string {
 	id, name := cssString(formID), cssString(fieldName)
 	return fmt.Sprintf("[id=%s] [name=%s], [form=%s][name=%s]", id, name, id, name)
+}
+
+// textCapable lists the controls a credential may be typed into.
+//
+// This is a security control, not tidiness. chromedp.SendKeys SPECIAL-CASES
+// <input type="file">: it treats the value as a local path and calls
+// DOM.setFileInputFiles. So if a configured field name resolved to a file
+// input and the password happened to look like a path, submitting the form
+// would upload that local file to the site instead of typing a credential.
+//
+// A positive allowlist, for the same reason internal/input allowlists schemes:
+// the failure mode of guessing wrong is disclosure of a local file.
+var textCapable = map[string]bool{
+	"textarea":       true,
+	"input:text":     true,
+	"input:password": true,
+	"input:email":    true,
+	"input:tel":      true,
+	"input:url":      true,
+	"input:search":   true,
+	"input:number":   true,
+}
+
+// jsFieldKind describes the control a selector resolves to, as "tag" or
+// "input:type". An input with no type attribute defaults to text, exactly as
+// the browser treats it.
+const jsFieldKind = `function (selector) {
+  const el = document.querySelector(selector);
+  if (!el) return "";
+  const tag = el.tagName.toLowerCase();
+  if (tag !== "input") return tag;
+  return "input:" + (el.getAttribute("type") || "text").toLowerCase();
+}`
+
+// checkFieldTypable refuses to type a credential into anything but a
+// text-capable control. See textCapable.
+func (b *Browser) checkFieldTypable(ctx context.Context, what, selector string) error {
+	expr, err := jsCall(jsFieldKind, selector)
+	if err != nil {
+		return err
+	}
+
+	var kind string
+	stepCtx, cancel := context.WithTimeout(ctx, b.findTimeout())
+	defer cancel()
+	if err := chromedp.Run(stepCtx, chromedp.Evaluate(expr, &kind)); err != nil {
+		return fmt.Errorf("%w: inspecting the %s field: %w", ErrLoginFailed, what, err)
+	}
+
+	switch {
+	case kind == "":
+		return nil // not there yet; the fill below reports it properly
+	case kind == "input:file":
+		return fmt.Errorf("%w: the %s field is a file input. Refusing to enter credentials: "+
+			"typing into one uploads a LOCAL FILE named by the value instead of entering it",
+			ErrLoginFailed, what)
+	case !textCapable[kind]:
+		return fmt.Errorf("%w: the %s field is a %s, which cannot hold a typed credential. "+
+			"Check the name in .env", ErrLoginFailed, what, kind)
+	}
+	return nil
 }
 
 // fillField types value into the field at sel, REPLACING whatever is there.
@@ -368,10 +438,13 @@ func typeInto(sel, value string) chromedp.Action {
 	})
 }
 
-// submitControls is the query for a form's submit controls. A <button> with no
-// type attribute is a submit button per the HTML spec, but [type="submit"]
-// matches on the attribute being literally present, so both are needed.
-const submitControls = `[type="submit"], button:not([type])`
+// submitControls is the query for a form's submit controls.
+//
+// Three forms, because HTML has three. A <button> with no type attribute is a
+// submit button per the spec, but [type="submit"] matches on the attribute
+// being literally present. And <input type="image"> is a submit control too,
+// with its own formaction and its own submitted name and coordinate fields.
+const submitControls = `[type="submit"], [type="image"], button:not([type])`
 
 // submitMarker is stamped on the control this run intends to click, so Go can
 // address the exact element JavaScript chose. querySelector returns only the
@@ -495,11 +568,15 @@ func (b *Browser) markClickableSubmit(ctx context.Context, formID string) (bool,
 const jsMarkClickableSubmit = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return false;
-  // form.elements includes controls associated from OUTSIDE the form via
-  // form="<id>", which a descendant query never sees. <button form="login"
-  // name="op" formaction="/authenticate"> is valid markup, and its name, value
-  // and formaction all matter.
-  const submits = Array.from(f.elements).filter((e) => e.matches(controls));
+  // Membership is decided by e.form, the element's own form owner, not by
+  // descendancy and not by f.elements.
+  //
+  // Descendancy misses <button form="login"> placed elsewhere in the document,
+  // which the browser submits normally. And f.elements is not a superset of it:
+  // the spec has it exclude input elements in the Image Button state, so
+  // <input type="image"> — a submit control with its own formaction and its own
+  // name.x/name.y fields — is absent from it entirely.
+  const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
   for (const c of submits) { c.removeAttribute(marker); }
   for (const c of submits) {
     if (c.disabled) continue;
@@ -529,11 +606,15 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
 const jsRequestSubmit = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) throw new Error("form is gone");
-  // form.elements includes controls associated from OUTSIDE the form via
-  // form="<id>", which a descendant query never sees. <button form="login"
-  // name="op" formaction="/authenticate"> is valid markup, and its name, value
-  // and formaction all matter.
-  const submits = Array.from(f.elements).filter((e) => e.matches(controls));
+  // Membership is decided by e.form, the element's own form owner, not by
+  // descendancy and not by f.elements.
+  //
+  // Descendancy misses <button form="login"> placed elsewhere in the document,
+  // which the browser submits normally. And f.elements is not a superset of it:
+  // the spec has it exclude input elements in the Image Button state, so
+  // <input type="image"> — a submit control with its own formaction and its own
+  // name.x/name.y fields — is absent from it entirely.
+  const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
   const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (typeof f.requestSubmit === "function") { c ? f.requestSubmit(c) : f.requestSubmit(); return "requestSubmit"; }
   f.submit(); return "submit";
@@ -603,7 +684,56 @@ func cookieDigests(ctx context.Context) (map[string]string, error) {
 	return digests, err
 }
 
-// changedCookies returns the names of cookies that appeared, or whose value
+// sessionEvidence is everything shared across this browser's tabs that a
+// sign-in could plausibly change: the cookie jar, and the page's localStorage
+// and sessionStorage.
+//
+// Cookies alone were not enough. A token-backed SPA authenticates over fetch,
+// puts its access token in localStorage and removes the form, setting no cookie
+// at all — and because every crawl tab shares that origin's storage, it really
+// is signed in. Demanding a cookie mutation called that a failure.
+//
+// Storage is read from the login page's origin, which is the origin whose
+// storage the crawl will read.
+func (b *Browser) sessionEvidence(ctx context.Context) (map[string]string, error) {
+	evidence, err := cookieDigests(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Storage is unreadable on an opaque origin and when a policy forbids it.
+	// That is not a login failure: the cookie half of the evidence still
+	// answers the question, so the error is deliberately dropped rather than
+	// propagated. Assigned to _ so the decision is visible and greppable.
+	var stored map[string]string
+	readErr := chromedp.Run(ctx, chromedp.Evaluate("("+jsStorageSnapshot+").call(null)", &stored))
+	_ = readErr
+	for k, v := range stored {
+		sum := sha256.Sum256([]byte(v))
+		evidence[k] = hex.EncodeToString(sum[:8])
+	}
+	return evidence, nil
+}
+
+// jsStorageSnapshot returns every localStorage and sessionStorage entry, keyed
+// so the two cannot mask one another. Accessing either throws on an opaque
+// origin, so both are guarded.
+const jsStorageSnapshot = `function () {
+  const out = {};
+  const read = (store, label) => {
+    try {
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i);
+        out[label + ":" + k + "\u0000"] = store.getItem(k) || "";
+      }
+    } catch (e) { /* opaque origin or storage disabled */ }
+  };
+  read(window.localStorage, "localStorage");
+  read(window.sessionStorage, "sessionStorage");
+  return out;
+}`
+
+// changedNames returns the names of entries that appeared, or whose value
 // changed, between the two snapshots.
 //
 // A NEW NAME is not required, and that is the point. The obvious flow — the
@@ -613,19 +743,19 @@ func cookieDigests(ctx context.Context) (map[string]string, error) {
 // sites outright. Any server that upgrades a session in place still rotates the
 // identifier, because not rotating it is session fixation, so the value change
 // is the signal that actually generalizes.
-func changedCookies(before, after map[string]string) []string {
+func changedNames(before, after map[string]string) []string {
 	var changed []string
 	for key, digest := range after {
 		if old, existed := before[key]; !existed || old != digest {
-			changed = append(changed, cookieName(key))
+			changed = append(changed, entryName(key))
 		}
 	}
 	slices.Sort(changed)
 	return slices.Compact(changed)
 }
 
-// cookieName recovers the display name from a cookieDigests key.
-func cookieName(key string) string {
+// entryName recovers the display name from a sessionEvidence key.
+func entryName(key string) string {
 	name, _, _ := strings.Cut(key, "\x00")
 	return name
 }
@@ -773,11 +903,15 @@ const jsFormAbsent = `function (formID) {
 const jsSubmitDestination = `function (formID, marker, controls) {
   const f = document.getElementById(formID);
   if (!f) return "";
-  // form.elements includes controls associated from OUTSIDE the form via
-  // form="<id>", which a descendant query never sees. <button form="login"
-  // name="op" formaction="/authenticate"> is valid markup, and its name, value
-  // and formaction all matter.
-  const submits = Array.from(f.elements).filter((e) => e.matches(controls));
+  // Membership is decided by e.form, the element's own form owner, not by
+  // descendancy and not by f.elements.
+  //
+  // Descendancy misses <button form="login"> placed elsewhere in the document,
+  // which the browser submits normally. And f.elements is not a superset of it:
+  // the spec has it exclude input elements in the Image Button state, so
+  // <input type="image"> — a submit control with its own formaction and its own
+  // name.x/name.y fields — is absent from it entirely.
+  const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
   const c = submits.find((e) => e.hasAttribute(marker)) || submits[0];
   if (c && c.hasAttribute("formaction")) { return c.formAction || ""; }
   return f.action || "";

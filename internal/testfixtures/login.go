@@ -596,3 +596,100 @@ func (f *fixture) loginRedirectingPost(w http.ResponseWriter, r *http.Request) {
 	}
 	f.html(w, loginForm("/login-redirectingpost", ""))
 }
+
+// loginFileField serves a form whose password control is a FILE input.
+//
+// chromedp.SendKeys special-cases those: it treats the value as a local path
+// and calls DOM.setFileInputFiles, so a path-shaped password would upload that
+// local file to the site instead of being typed. pagevet must refuse before
+// typing anything.
+func (f *fixture) loginFileField(w http.ResponseWriter, _ *http.Request) {
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login" enctype="multipart/form-data">
+  <input type="text" name=%q>
+  <input type="file" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField))
+}
+
+// loginImageSubmit uses <input type="image"> as its submitter, carrying the
+// name/value the handler requires. It is a submit control like any other.
+func (f *fixture) loginImageSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		okCreds := r.PostFormValue(LoginUserField) == LoginUser &&
+			r.PostFormValue(LoginPassField) == LoginPass
+		// An image submitter posts name.x / name.y rather than name=value.
+		if !okCreds || r.PostFormValue(LoginOpField+".x") == "" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, "<p>missing image submitter or bad credentials</p>")
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	// A 1x1 transparent GIF, so the control renders a real box.
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-imagesubmit">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="image" name=%q width="40" height="20" alt="Sign in"
+     src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField, LoginOpField))
+}
+
+// loginTokenSPA authenticates over fetch and keeps its token in localStorage,
+// setting NO cookie. Every crawl tab shares that origin's storage, so the
+// browser really is signed in — a success check demanding a cookie called this
+// a failure.
+func (f *fixture) loginTokenSPA(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostFormValue(LoginUserField) != LoginUser || r.PostFormValue(LoginPassField) != LoginPass {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		f.write(w, `{"token":"fixture-jwt"}`)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<div id="app">
+<form id=%q method="post" action="/login-tokenspa">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <button type="submit">Sign in</button>
+</form>
+</div>
+<script>
+document.getElementById(%q).addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = new URLSearchParams(new FormData(e.target));
+  const r = await fetch("/login-tokenspa", {method: "POST", body});
+  if (!r.ok) return;
+  const j = await r.json();
+  localStorage.setItem("access_token", j.token);
+  document.getElementById("app").innerHTML = "<h1>signed in</h1>";
+});
+</script>
+`, LoginFormID, LoginUserField, LoginPassField, LoginFormID))
+}

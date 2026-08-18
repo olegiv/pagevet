@@ -184,7 +184,7 @@ func TestEvaluatedJSIsConstant(t *testing.T) {
 	}
 }
 
-func TestChangedCookies(t *testing.T) {
+func TestChangedNames(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -237,13 +237,13 @@ func TestChangedCookies(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := changedCookies(tt.before, tt.after)
+			got := changedNames(tt.before, tt.after)
 			if len(got) != len(tt.want) {
-				t.Fatalf("changedCookies() = %v, want %v", got, tt.want)
+				t.Fatalf("changedNames() = %v, want %v", got, tt.want)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Errorf("changedCookies() = %v, want %v", got, tt.want)
+					t.Errorf("changedNames() = %v, want %v", got, tt.want)
 					break
 				}
 			}
@@ -251,14 +251,14 @@ func TestChangedCookies(t *testing.T) {
 	}
 }
 
-func TestCookieName(t *testing.T) {
+func TestEntryName(t *testing.T) {
 	t.Parallel()
 
-	if got, want := cookieName("SSESS\x00.example.com/"), "SSESS"; got != want {
-		t.Errorf("cookieName() = %q, want %q", got, want)
+	if got, want := entryName("SSESS\x00.example.com/"), "SSESS"; got != want {
+		t.Errorf("entryName() = %q, want %q", got, want)
 	}
-	if got, want := cookieName("bare"), "bare"; got != want {
-		t.Errorf("cookieName() = %q, want %q", got, want)
+	if got, want := entryName("bare"), "bare"; got != want {
+		t.Errorf("entryName() = %q, want %q", got, want)
 	}
 }
 

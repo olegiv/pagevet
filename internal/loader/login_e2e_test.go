@@ -817,3 +817,75 @@ func TestLogin_ReportsPostRedirectedToBlockedHost(t *testing.T) {
 		t.Errorf("error = %q, want it to warn that the credentials may have been sent", err)
 	}
 }
+
+// TestLogin_RefusesToTypeIntoAFileInput is the most dangerous shape found in
+// review, and the test is deliberately blunt about why.
+//
+// chromedp.SendKeys special-cases <input type="file">: it treats the value as
+// a local path and calls DOM.setFileInputFiles. A password that looks like a
+// path would therefore upload that local file to the site rather than being
+// typed. pagevet has to refuse before anything is entered.
+func TestLogin_RefusesToTypeIntoAFileInput(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) {
+		s.URL = env.url("/login-filefield")
+		s.Password = "/etc/passwd" // a real, readable path
+	})
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() typed into a file input; a local file may have been uploaded")
+	}
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Errorf("error = %v, want it to wrap ErrLoginFailed", err)
+	}
+	if !strings.Contains(err.Error(), "file input") {
+		t.Errorf("error = %q, want it to name the file input", err)
+	}
+	if !strings.Contains(err.Error(), "LOCAL FILE") {
+		t.Errorf("error = %q, want it to say what the danger is", err)
+	}
+}
+
+// TestLogin_ImageSubmitControl covers <input type="image">, a submit control
+// with its own formaction and its own submitted name.x / name.y fields.
+func TestLogin_ImageSubmitControl(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-imagesubmit") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the image submitter was probably not used", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_TokenInLocalStorageCountsAsASession covers a token-backed SPA that
+// sets no cookie at all. Every crawl tab shares that origin's storage, so the
+// browser really is signed in; demanding a cookie mutation called it a failure.
+func TestLogin_TokenInLocalStorageCountsAsASession(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-tokenspa") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; a localStorage-backed session was not recognized", err)
+	}
+}
+
+// TestLogin_TokenSPAWithWrongPasswordStillFails is the control. The token is
+// only stored on a successful response, so a storage-aware success check must
+// still reject bad credentials — otherwise the test above proves nothing.
+func TestLogin_TokenSPAWithWrongPasswordStillFails(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) {
+		s.URL = env.url("/login-tokenspa")
+		s.Password = "definitely-not-the-password"
+	})
+
+	if err := signIn(t, br); err == nil {
+		t.Fatal("Login() succeeded with a wrong password against the token SPA")
+	}
+}
