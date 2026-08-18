@@ -193,7 +193,7 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return err
 	}
 
-	before, err := b.sessionEvidence(ctx)
+	before, err := b.takeSnapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: reading the session state before submit: %w", ErrLoginFailed, err)
 	}
@@ -222,17 +222,15 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return destErr
 	}
 
-	// Refuse to type into a control that is not text-capable, BEFORE typing.
-	// chromedp.SendKeys turns a file input into a local-file upload.
-	if typErr := b.checkFieldTypable(ctx, "username", userSel); typErr != nil {
-		return typErr
+	// Choose and validate each control, then act on the element that was
+	// chosen rather than re-running a selector that might resolve elsewhere.
+	if markErr := b.markCredentialField(ctx, "username", spec.FormID, spec.UserField); markErr != nil {
+		return markErr
 	}
-	if typErr := b.checkFieldTypable(ctx, "password", passSel); typErr != nil {
-		return typErr
-	}
+	markedUser := "[" + fieldMarker + "]"
 
 	// Fill both fields. Errors below name the SELECTOR, never the value.
-	switch timedOut, findErr := b.runFind(ctx, b.fillField(userSel, spec.Username)); {
+	switch timedOut, findErr := b.runFind(ctx, b.fillField(markedUser, spec.Username)); {
 	case timedOut:
 		return fmt.Errorf("%w: %s has no field named %q. Check USERNAME_NAME",
 			ErrLoginFailed, formLabel, spec.UserField)
@@ -240,7 +238,10 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return fmt.Errorf("%w: filling the username field %s: %w", ErrLoginFailed, userSel, findErr)
 	}
 
-	switch timedOut, findErr := b.runFind(ctx, b.fillField(passSel, spec.Password)); {
+	if markErr := b.markCredentialField(ctx, "password", spec.FormID, spec.PassField); markErr != nil {
+		return markErr
+	}
+	switch timedOut, findErr := b.runFind(ctx, b.fillField("["+fieldMarker+"]", spec.Password)); {
 	case timedOut:
 		return fmt.Errorf("%w: %s has no field named %q. Check PASSWORD_NAME",
 			ErrLoginFailed, formLabel, spec.PassField)
@@ -274,11 +275,11 @@ func (b *Browser) doLogin(ctx context.Context, spec *login.Spec) error {
 		return fmt.Errorf("%w. The credentials may already have reached it", landedErr)
 	}
 
-	after, err := b.sessionEvidence(ctx)
+	after, err := b.takeSnapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: reading the session state after submit: %w", ErrLoginFailed, err)
 	}
-	changed := changedNames(before, after)
+	changed := after.changedSince(before)
 
 	formGone, err := formAbsent(ctx, spec.FormID)
 	if err != nil {
@@ -317,16 +318,16 @@ func fieldSelector(formID, fieldName string) string {
 	return fmt.Sprintf("[id=%s] [name=%s], [form=%s][name=%s]", id, name, id, name)
 }
 
+// fieldMarker is stamped on the control a credential will be typed into, so
+// every later action addresses the exact element that was validated rather than
+// re-running a selector that could resolve elsewhere.
+const fieldMarker = "data-pagevet-field"
+
 // textCapable lists the controls a credential may be typed into.
 //
-// This is a security control, not tidiness. chromedp.SendKeys SPECIAL-CASES
-// <input type="file">: it treats the value as a local path and calls
-// DOM.setFileInputFiles. So if a configured field name resolved to a file
-// input and the password happened to look like a path, submitting the form
-// would upload that local file to the site instead of typing a credential.
-//
 // A positive allowlist, for the same reason internal/input allowlists schemes:
-// the failure mode of guessing wrong is disclosure of a local file.
+// the failure mode of guessing wrong is disclosure of a local file. See
+// fillField for why that is not hypothetical.
 var textCapable = map[string]bool{
 	"textarea":       true,
 	"input:text":     true,
@@ -338,21 +339,39 @@ var textCapable = map[string]bool{
 	"input:number":   true,
 }
 
-// jsFieldKind describes the control a selector resolves to, as "tag" or
-// "input:type". An input with no type attribute defaults to text, exactly as
-// the browser treats it.
-const jsFieldKind = `function (selector) {
-  const el = document.querySelector(selector);
-  if (!el) return "";
-  const tag = el.tagName.toLowerCase();
-  if (tag !== "input") return tag;
-  return "input:" + (el.getAttribute("type") || "text").toLowerCase();
+// jsMarkField picks the control a credential should go into and stamps it,
+// returning its kind as "tag" or "input:type" — or "" when there is no match.
+//
+// Two things it must get right that a bare querySelector does not:
+//
+//   - The FIRST match is not necessarily the usable one. A password-manager
+//     decoy, or an inactive copy from a responsive layout, sits before the real
+//     field often enough to matter; an invisible control is skipped when a
+//     visible one exists.
+//   - Membership is decided by e.form, so a control associated from outside the
+//     form via form="<id>" is included, exactly as for submit controls.
+const jsMarkField = `function (formID, name, marker) {
+  const f = document.getElementById(formID);
+  if (!f) return "";
+  // Clear the mark EVERYWHERE, not just from controls of this name. The
+  // username is marked and filled before the password is marked, so a mark
+  // left behind would make the marker selector match two elements and the
+  // password would be typed into whichever came first — the username box.
+  for (const e of document.querySelectorAll("[" + marker + "]")) { e.removeAttribute(marker); }
+  const named = Array.from(document.getElementsByName(name)).filter((e) => e.form === f);
+  const visible = (e) => !e.disabled && e.getClientRects().length > 0 &&
+    getComputedStyle(e).visibility !== "hidden";
+  const chosen = named.find(visible) || named[0];
+  if (!chosen) return "";
+  chosen.setAttribute(marker, "");
+  const tag = chosen.tagName.toLowerCase();
+  return tag === "input" ? "input:" + (chosen.getAttribute("type") || "text").toLowerCase() : tag;
 }`
 
-// checkFieldTypable refuses to type a credential into anything but a
-// text-capable control. See textCapable.
-func (b *Browser) checkFieldTypable(ctx context.Context, what, selector string) error {
-	expr, err := jsCall(jsFieldKind, selector)
+// markCredentialField chooses the control for one credential, stamps it, and
+// refuses anything a credential must not be typed into.
+func (b *Browser) markCredentialField(ctx context.Context, what, formID, name string) error {
+	expr, err := jsCall(jsMarkField, formID, name, fieldMarker)
 	if err != nil {
 		return err
 	}
@@ -380,19 +399,22 @@ func (b *Browser) checkFieldTypable(ctx context.Context, what, selector string) 
 
 // fillField types value into the field at sel, REPLACING whatever is there.
 //
-// SendKeys alone appends: it focuses the field and types, so a server-prefilled
-// username turns "editor" into "guesteditor" and a valid account fails to
-// authenticate. The field therefore has to be emptied first.
+// The text is INSERTED, never sent as keystrokes. chromedp.SendKeys inspects
+// the node it lands on and, for <input type="file">, calls
+// DOM.setFileInputFiles instead — so a path-shaped password would upload a
+// local file to the site. A type check before typing narrows that but cannot
+// close it: SendKeys re-resolves the node, and a focus handler is free to
+// change an input's type in between. Input.insertText has no such branch, so
+// the dangerous path simply does not exist here.
 //
-// chromedp.Clear is not the way to do it. For an <input> it calls
-// DOM.setAttributeValue(value, ""), which sets the ATTRIBUTE and dispatches no
-// events at all — so a framework-controlled input keeps its own state and never
-// learns the field changed.
+// It still fires an input event, which is what a framework-controlled input
+// listens for, and it treats a tab or newline in a password as text rather than
+// as Tab and Enter.
 //
-// Selecting the existing text and typing over it is what a person does, and it
-// produces the same event sequence: Input.dispatchKeyEvent carries a native
-// "selectAll" editing command, which needs no Ctrl-vs-Cmd guess, and SendKeys
-// then replaces the selection with real key events.
+// The existing contents are selected first, so the insertion replaces them: a
+// server-prefilled username would otherwise turn "editor" into "guesteditor".
+// Input.dispatchKeyEvent carries a native "selectAll" editing command, which
+// needs no Ctrl-versus-Cmd guess.
 func (b *Browser) fillField(sel, value string) chromedp.Action {
 	return chromedp.Tasks{
 		chromedp.Focus(sel, chromedp.ByQuery),
@@ -401,41 +423,17 @@ func (b *Browser) fillField(sel, value string) chromedp.Action {
 				WithCommands([]string{"selectAll"}).
 				Do(ctx)
 		}),
-		// An empty value would leave the selection sitting there, so clear it
-		// explicitly. SendKeys with "" is a no-op, not a delete.
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			if value != "" {
-				return nil
+			// insertText with "" does not clear a selection, so an empty
+			// credential needs the delete command explicitly.
+			if value == "" {
+				return input.DispatchKeyEvent(input.KeyRawDown).
+					WithCommands([]string{"deleteBackward"}).
+					Do(ctx)
 			}
-			return input.DispatchKeyEvent(input.KeyRawDown).
-				WithCommands([]string{"deleteBackward"}).
-				Do(ctx)
+			return input.InsertText(value).Do(ctx)
 		}),
-		typeInto(sel, value),
 	}
-}
-
-// typeInto puts value into the focused field.
-//
-// SendKeys dispatches real key events, which is what a framework-controlled
-// input needs to see — but it INTERPRETS the text as keystrokes, so a tab
-// becomes a focus change and a newline becomes Enter. The .env parser decodes
-// \t and \n escapes and the password check deliberately allows the result,
-// so a password containing either would tab away mid-entry or submit the form
-// with half a password in it — and, worse, submit it a second time when the
-// explicit submission followed.
-//
-// Such a password is rare, so the common path keeps the key events it was
-// chosen for, and only a value SendKeys would misread is inserted as literal
-// text instead. Input.insertText still fires an input event, which is what
-// controlled components listen for.
-func typeInto(sel, value string) chromedp.Action {
-	if !strings.ContainsAny(value, "\r\n\t") {
-		return chromedp.SendKeys(sel, value, chromedp.ByQuery)
-	}
-	return chromedp.ActionFunc(func(ctx context.Context) error {
-		return input.InsertText(value).Do(ctx)
-	})
 }
 
 // submitControls is the query for a form's submit controls.
@@ -684,40 +682,69 @@ func cookieDigests(ctx context.Context) (map[string]string, error) {
 	return digests, err
 }
 
-// sessionEvidence is everything shared across this browser's tabs that a
-// sign-in could plausibly change: the cookie jar, and the page's localStorage
-// and sessionStorage.
+// snapshot is the shared state a sign-in could plausibly change: the cookie
+// jar, plus the page's localStorage.
+//
+// origin is recorded because web storage is PER-ORIGIN. The before and after
+// snapshots are taken either side of a submission that may navigate somewhere
+// else entirely, and comparing origin A's storage against origin B's would
+// report every key in B as new — declaring a failed login a success. When the
+// origin moves, the storage half is simply not evidence, and the cookie jar
+// (which is not origin-scoped in this way) answers alone.
+type snapshot struct {
+	origin  string
+	cookies map[string]string
+	storage map[string]string
+}
+
+// takeSnapshot records the session state as it is now.
 //
 // Cookies alone were not enough. A token-backed SPA authenticates over fetch,
 // puts its access token in localStorage and removes the form, setting no cookie
 // at all — and because every crawl tab shares that origin's storage, it really
 // is signed in. Demanding a cookie mutation called that a failure.
-//
-// Storage is read from the login page's origin, which is the origin whose
-// storage the crawl will read.
-func (b *Browser) sessionEvidence(ctx context.Context) (map[string]string, error) {
-	evidence, err := cookieDigests(ctx)
+func (b *Browser) takeSnapshot(ctx context.Context) (snapshot, error) {
+	cookies, err := cookieDigests(ctx)
 	if err != nil {
-		return nil, err
+		return snapshot{}, err
 	}
+	snap := snapshot{cookies: cookies, storage: map[string]string{}}
 
-	// Storage is unreadable on an opaque origin and when a policy forbids it.
-	// That is not a login failure: the cookie half of the evidence still
-	// answers the question, so the error is deliberately dropped rather than
-	// propagated. Assigned to _ so the decision is visible and greppable.
-	var stored map[string]string
-	readErr := chromedp.Run(ctx, chromedp.Evaluate("("+jsStorageSnapshot+").call(null)", &stored))
-	_ = readErr
-	for k, v := range stored {
-		sum := sha256.Sum256([]byte(v))
-		evidence[k] = hex.EncodeToString(sum[:8])
+	var raw struct {
+		Origin  string            `json:"origin"`
+		Entries map[string]string `json:"entries"`
 	}
-	return evidence, nil
+	// Storage is unreadable on an opaque origin and when a policy forbids it.
+	// That is not a login failure, so the error is deliberately dropped: the
+	// cookie half still answers the question. Assigned to _ so the decision is
+	// visible and greppable.
+	readErr := chromedp.Run(ctx, chromedp.Evaluate("("+jsStorageSnapshot+").call(null)", &raw))
+	_ = readErr
+
+	snap.origin = raw.Origin
+	for k, v := range raw.Entries {
+		sum := sha256.Sum256([]byte(v))
+		snap.storage[k] = hex.EncodeToString(sum[:8])
+	}
+	return snap, nil
 }
 
-// jsStorageSnapshot returns every localStorage and sessionStorage entry, keyed
-// so the two cannot mask one another. Accessing either throws on an opaque
-// origin, so both are guarded.
+// changedSince returns the names of entries that appeared, or whose value
+// changed, between two snapshots.
+//
+// Storage is compared only when the origin has not moved; see snapshot.origin.
+func (s snapshot) changedSince(before snapshot) []string {
+	changed := changedNames(before.cookies, s.cookies)
+	if s.origin != "" && s.origin == before.origin {
+		changed = append(changed, changedNames(before.storage, s.storage)...)
+		slices.Sort(changed)
+		changed = slices.Compact(changed)
+	}
+	return changed
+}
+
+// jsStorageSnapshot returns the page's origin and its localStorage entries.
+// Accessing storage throws on an opaque origin, so the read is guarded.
 const jsStorageSnapshot = `function () {
   const out = {};
   const read = (store, label) => {
@@ -728,9 +755,13 @@ const jsStorageSnapshot = `function () {
       }
     } catch (e) { /* opaque origin or storage disabled */ }
   };
+  // localStorage ONLY. sessionStorage belongs to the browsing context, and
+  // this tab is closed the moment Login returns — the crawl tabs are created
+  // independently and start with an empty one. Counting it would report a
+  // session the crawl will never have, and the run would crawl anonymously
+  // while believing itself signed in.
   read(window.localStorage, "localStorage");
-  read(window.sessionStorage, "sessionStorage");
-  return out;
+  return { origin: window.location.origin, entries: out };
 }`
 
 // changedNames returns the names of entries that appeared, or whose value

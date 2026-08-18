@@ -3,6 +3,7 @@ package testfixtures
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -688,6 +689,89 @@ document.getElementById(%q).addEventListener("submit", async (e) => {
   if (!r.ok) return;
   const j = await r.json();
   localStorage.setItem("access_token", j.token);
+  document.getElementById("app").innerHTML = "<h1>signed in</h1>";
+});
+</script>
+`, LoginFormID, LoginUserField, LoginPassField, LoginFormID))
+}
+
+// loginDecoyFields puts a hidden control with the configured name BEFORE the
+// real one, the way a password-manager decoy or an inactive responsive-layout
+// copy does. document.querySelector always returns the first match, so a naive
+// selector types into the decoy and the real field stays empty.
+func (f *fixture) loginDecoyFields(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			f.write(w, "bad form")
+			return
+		}
+		// Both controls of each name submit, so the POST carries two values
+		// apiece and PostFormValue would return the empty decoy's. What is
+		// under test is that the credential reached the REAL field, so every
+		// value is considered.
+		if !slices.Contains(r.PostForm[LoginUserField], LoginUser) ||
+			!slices.Contains(r.PostForm[LoginPassField], LoginPass) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			f.write(w, "<p>the decoy fields were filled instead</p>")
+			return
+		}
+		setSession(w)
+		http.Redirect(w, r, "/private", http.StatusSeeOther)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<form id=%q method="post" action="/login-decoy">
+  <input type="text" name=%q style="display:none">
+  <input type="password" name=%q style="display:none">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <input type="submit" value="Sign in">
+</form>
+`, LoginFormID, LoginUserField, LoginPassField, LoginUserField, LoginPassField))
+}
+
+// loginSessionStorageOnly authenticates over fetch and stores its token in
+// sessionStorage, which belongs to the tab that created it. The login tab is
+// closed when Login returns and the crawl tabs start with an empty one, so this
+// is NOT a session the crawl inherits — and must not be reported as one.
+func (f *fixture) loginSessionStorageOnly(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostFormValue(LoginUserField) != LoginUser || r.PostFormValue(LoginPassField) != LoginPass {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		f.write(w, `{"token":"fixture-jwt"}`)
+		return
+	}
+	f.html(w, fmt.Sprintf(`<!doctype html>
+<meta charset="utf-8">
+<title>sign in</title>
+<div id="app">
+<form id=%q method="post" action="/login-sessiononly">
+  <input type="text" name=%q>
+  <input type="password" name=%q>
+  <button type="submit">Sign in</button>
+</form>
+</div>
+<script>
+document.getElementById(%q).addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = new URLSearchParams(new FormData(e.target));
+  const r = await fetch("/login-sessiononly", {method: "POST", body});
+  if (!r.ok) return;
+  const j = await r.json();
+  sessionStorage.setItem("access_token", j.token);
   document.getElementById("app").innerHTML = "<h1>signed in</h1>";
 });
 </script>

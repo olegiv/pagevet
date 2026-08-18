@@ -344,3 +344,71 @@ func TestCheckHostOnceDoesNotCacheACanceledCheck(t *testing.T) {
 		t.Errorf("CheckHost called %d times, want 2: a canceled check must not be cached", calls)
 	}
 }
+
+// TestSnapshotChangedSince covers the origin rule, which is the subtle half of
+// treating web storage as session evidence.
+func TestSnapshotChangedSince(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		before, after snapshot
+		want          []string
+	}{
+		{
+			name:   "a cookie changed",
+			before: snapshot{origin: "https://a.test", cookies: map[string]string{"sid\x00.a/": "1"}},
+			after:  snapshot{origin: "https://a.test", cookies: map[string]string{"sid\x00.a/": "2"}},
+			want:   []string{"sid"},
+		},
+		{
+			// The token-backed SPA: no cookie anywhere, a token appears.
+			name:   "storage changed on the same origin",
+			before: snapshot{origin: "https://a.test", cookies: map[string]string{}, storage: map[string]string{}},
+			after: snapshot{origin: "https://a.test", cookies: map[string]string{},
+				storage: map[string]string{"localStorage:access_token\x00": "abc"}},
+			want: []string{"localStorage:access_token"},
+		},
+		{
+			// THE false positive this rule exists to prevent. Storage is
+			// per-origin, so after a redirect elsewhere every key looks new —
+			// and a failed login would have been declared a success.
+			name:   "storage ignored when the origin moved",
+			before: snapshot{origin: "https://a.test", cookies: map[string]string{}, storage: map[string]string{"localStorage:x\x00": "1"}},
+			after: snapshot{origin: "https://b.test", cookies: map[string]string{},
+				storage: map[string]string{"localStorage:y\x00": "2", "localStorage:z\x00": "3"}},
+			want: nil,
+		},
+		{
+			// A cookie change still counts across an origin move: the jar is
+			// not scoped the way storage is.
+			name:   "cookies still count when the origin moved",
+			before: snapshot{origin: "https://a.test", cookies: map[string]string{}},
+			after:  snapshot{origin: "https://b.test", cookies: map[string]string{"sid\x00.b/": "1"}},
+			want:   []string{"sid"},
+		},
+		{
+			name:   "unreadable storage is not evidence",
+			before: snapshot{origin: "", cookies: map[string]string{}, storage: map[string]string{}},
+			after:  snapshot{origin: "", cookies: map[string]string{}, storage: map[string]string{"localStorage:x\x00": "1"}},
+			want:   nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tt.after.changedSince(tt.before)
+			if len(got) != len(tt.want) {
+				t.Fatalf("changedSince() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("changedSince() = %v, want %v", got, tt.want)
+					break
+				}
+			}
+		})
+	}
+}

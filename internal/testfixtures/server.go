@@ -91,6 +91,8 @@ func Handler(logf func(format string, args ...any)) http.Handler {
 	mux.HandleFunc("/login-filefield", f.loginFileField)
 	mux.HandleFunc("/login-imagesubmit", f.loginImageSubmit)
 	mux.HandleFunc("/login-tokenspa", f.loginTokenSPA)
+	mux.HandleFunc("/login-decoy", f.loginDecoyFields)
+	mux.HandleFunc("/login-sessiononly", f.loginSessionStorageOnly)
 	mux.HandleFunc("/logout", f.logout)
 	mux.HandleFunc("/grant", f.grant)
 	mux.HandleFunc("/private", f.private)

@@ -889,3 +889,39 @@ func TestLogin_TokenSPAWithWrongPasswordStillFails(t *testing.T) {
 		t.Fatal("Login() succeeded with a wrong password against the token SPA")
 	}
 }
+
+// TestLogin_SkipsHiddenDecoyFields covers a form carrying two controls of each
+// configured name, the hidden ones first. document.querySelector always returns
+// the first match, so the credentials went into the decoys and the real fields
+// stayed empty.
+func TestLogin_SkipsHiddenDecoyFields(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-decoy") })
+	if err := signIn(t, br); err != nil {
+		t.Fatalf("Login() error = %v; the hidden decoy fields were probably filled instead", err)
+	}
+	if res, _ := loadURL(t, br, env.url("/private")); res.Status != 200 {
+		t.Errorf("/private after Login = %d, want 200", res.Status)
+	}
+}
+
+// TestLogin_SessionStorageIsNotASession is the counterpart to the localStorage
+// test, and the distinction matters: sessionStorage belongs to the browsing
+// context. The login tab is closed when Login returns and every crawl tab
+// starts with an empty one, so a token kept only there is a session the crawl
+// will never have. Reporting success would leave the run crawling anonymously
+// while believing itself signed in.
+func TestLogin_SessionStorageIsNotASession(t *testing.T) {
+	env := e2e(t)
+
+	br := loginBrowser(t, env.srv.URL, func(s *login.Spec) { s.URL = env.url("/login-sessiononly") })
+
+	err := signIn(t, br)
+	if err == nil {
+		t.Fatal("Login() reported success for a token kept only in tab-scoped sessionStorage")
+	}
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Errorf("error = %v, want it to wrap ErrLoginFailed", err)
+	}
+}

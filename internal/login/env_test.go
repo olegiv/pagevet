@@ -503,3 +503,21 @@ func TestReadFileWhitespaceStillTrimmedForStructuralKeys(t *testing.T) {
 		t.Fatal("ReadFile() accepted a whitespace-only LOGIN_FORM_ID, want an error")
 	}
 }
+
+// TestParseKeepsBackslashBeforeApostrophe pins that \' is an unknown escape.
+//
+// An apostrophe needs no escaping inside double quotes, so consuming the
+// backslash would silently hand the browser a password one character shorter
+// than the .env visibly contains — and the account would fail to authenticate
+// with nothing to suggest the file had been reinterpreted.
+func TestParseKeepsBackslashBeforeApostrophe(t *testing.T) {
+	t.Parallel()
+
+	kv, err := parse(`K="abc\'def"`, ".env")
+	if err != nil {
+		t.Fatalf("parse() error = %v", err)
+	}
+	if got, want := kv["K"], `abc\'def`; got != want {
+		t.Errorf("parse()[K] = %q, want %q", got, want)
+	}
+}

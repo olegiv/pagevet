@@ -292,6 +292,11 @@ func checkTrailer(rest string) error {
 // unescape expands the escapes recognized inside a double-quoted value. An
 // unknown escape keeps its backslash rather than swallowing it, so a Windows
 // path or a regex in a value survives a round trip.
+//
+// \' is deliberately NOT in the set. An apostrophe needs no escaping inside
+// double quotes, so \' is an unknown escape like any other and both characters
+// are kept — consuming the backslash would hand the browser a password one
+// character shorter than the file plainly shows.
 func unescape(s string) string {
 	if !strings.ContainsRune(s, '\\') {
 		return s
@@ -311,7 +316,7 @@ func unescape(s string) string {
 			b.WriteByte('\r')
 		case 't':
 			b.WriteByte('\t')
-		case '"', '\'', '\\':
+		case '"', '\\':
 			b.WriteByte(s[i])
 		default:
 			b.WriteByte('\\')
