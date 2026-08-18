@@ -412,3 +412,44 @@ func TestSnapshotChangedSince(t *testing.T) {
 		})
 	}
 }
+
+// TestDisplayTargetDropsTheQuery is a credential-leak regression.
+//
+// A form with method="get" puts the configured field names in the query, and
+// those are whatever the .env says. verdict.RedactURL blanks a fixed list of
+// credential-like parameter names, which does not include user[password] — an
+// explicitly supported field name. So the query is dropped outright rather than
+// redacted whenever a URL the browser navigated to is printed.
+func TestDisplayTargetDropsTheQuery(t *testing.T) {
+	t.Parallel()
+
+	b := &Browser{opts: Options{RedactURLs: true}}
+
+	const secret = "hunter2-in-the-query"
+	tests := []struct {
+		name, in string
+		wantOmit bool
+	}{
+		{"password in a non-standard field", "https://x.test/login?user%5Bpassword%5D=" + secret, true},
+		{"password in a plain field", "https://x.test/login?pass=" + secret, true},
+		{"no query at all", "https://x.test/login", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := b.displayTarget(tt.in)
+			if strings.Contains(got, secret) {
+				t.Errorf("displayTarget(%q) = %q, leaks the credential", tt.in, got)
+			}
+			if tt.wantOmit && !strings.Contains(got, "query omitted") {
+				t.Errorf("displayTarget(%q) = %q, want it to say the query was omitted", tt.in, got)
+			}
+			// It still has to be useful: host and path survive.
+			if !strings.Contains(got, "x.test/login") {
+				t.Errorf("displayTarget(%q) = %q, want the host and path kept", tt.in, got)
+			}
+		})
+	}
+}

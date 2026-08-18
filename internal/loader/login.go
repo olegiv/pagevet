@@ -575,7 +575,12 @@ const jsMarkClickableSubmit = `function (formID, marker, controls) {
   // <input type="image"> — a submit control with its own formaction and its own
   // name.x/name.y fields — is absent from it entirely.
   const submits = Array.from(document.querySelectorAll(controls)).filter((e) => e.form === f);
-  for (const c of submits) { c.removeAttribute(marker); }
+  // Clear the mark EVERYWHERE, not just from this form's submit controls. A
+  // mark left on an element that has since changed type or form association
+  // would survive, and the click selector — which is document-wide — would
+  // press that stale element instead of the control whose destination was just
+  // validated.
+  for (const c of document.querySelectorAll("[" + marker + "]")) { c.removeAttribute(marker); }
   for (const c of submits) {
     if (c.disabled) continue;
     if (c.getClientRects().length === 0) continue;
@@ -856,7 +861,7 @@ func (b *Browser) checkDestination(ctx context.Context, what, rawURL string) err
 	}
 	if err := b.checkHostOnce(ctx, u.Hostname()); err != nil {
 		return fmt.Errorf("%w: %s leads to %s, which fails the address policy: %w. "+
-			"Refusing to enter credentials", ErrLoginFailed, what, b.display(rawURL), err)
+			"Refusing to enter credentials", ErrLoginFailed, what, b.displayTarget(rawURL), err)
 	}
 	return nil
 }
@@ -959,6 +964,29 @@ func formAbsent(ctx context.Context, formID string) (bool, error) {
 		return false, err
 	}
 	return absent, nil
+}
+
+// displayTarget renders a URL the BROWSER navigated to, for an error message.
+//
+// The query is dropped entirely rather than redacted. verdict.RedactURL blanks
+// the values of about twenty credential-like parameter names, which is right
+// for a crawled URL but not sufficient here: a form with method="get" puts the
+// configured field names in the query, and those are whatever the .env says —
+// `user[password]` is explicitly supported and is not on any fixed list. The
+// host and path are what a reader needs to act on an address-policy rejection;
+// the query never is.
+func (b *Browser) displayTarget(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// Unparseable: say nothing rather than guess which part is a secret.
+		return "(unparseable address)"
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	if u.RawQuery == "" && strings.Contains(rawURL, "?") {
+		return b.display(u.String()) + " (query omitted: it may hold a credential)"
+	}
+	return b.display(u.String())
 }
 
 // display renders a URL for an error message under the run's redaction policy,
