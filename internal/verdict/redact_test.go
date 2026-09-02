@@ -120,26 +120,36 @@ func TestRedactURL_NoCredentialsIsUnchanged(t *testing.T) {
 	}
 }
 
-// TestRedactURL_UnparseableKeepsBestEffort: a console message may embed
-// something that is not quite a URL. Dropping it would cost a diagnostic, so
-// the fragment is stripped by hand and the rest survives.
-func TestRedactURL_UnparseableKeepsBestEffort(t *testing.T) {
+func TestRedactURL_UnparseableIsSafelyRedacted(t *testing.T) {
 	t.Parallel()
 
 	// "%zz" is an invalid percent-escape, which makes url.Parse reject the
 	// whole string and sends RedactURL down its by-hand path.
-	fixtures := []string{"http://%zz/path#frag", "http://%zz/path"}
+	fixtures := []string{"http://user:pass@host/%zz?password=SECRET#frag", "http://%zz/path"}
 	for _, raw := range fixtures {
 		if _, err := url.Parse(raw); err == nil {
 			t.Fatalf("fixture %q parses cleanly; it no longer exercises the fallback", raw)
 		}
 	}
 
-	if got, want := RedactURL(fixtures[0]), "http://%zz/path"; got != want {
+	if got, want := RedactURL(fixtures[0]), "http://redacted@host/%zz?password=REDACTED"; got != want {
 		t.Errorf("RedactURL(%q) = %q, want %q", fixtures[0], got, want)
 	}
 	if got, want := RedactURL(fixtures[1]), "http://%zz/path"; got != want {
 		t.Errorf("RedactURL(%q) = %q, want %q", fixtures[1], got, want)
+	}
+}
+
+func TestRedactURL_MalformedQueryDoesNotBypassRedaction(t *testing.T) {
+	t.Parallel()
+
+	raw := "https://example.test/cb?access_token=SECRET%zz&keep=%zz"
+	got := RedactURL(raw)
+	if strings.Contains(got, "SECRET") {
+		t.Fatalf("RedactURL(%q) = %q, still contains the credential", raw, got)
+	}
+	if want := "https://example.test/cb?access_token=REDACTED&keep=%zz"; got != want {
+		t.Errorf("RedactURL(%q) = %q, want %q", raw, got, want)
 	}
 }
 
@@ -180,6 +190,11 @@ func TestRedactText(t *testing.T) {
 			name: "leaves text without URLs alone",
 			in:   "Uncaught ReferenceError: x is not defined",
 			want: "Uncaught ReferenceError: x is not defined",
+		},
+		{
+			name: "redacts malformed embedded URL",
+			in:   "failed at https://user:pass@example.test/%zz?password=SECRET#fragment after",
+			want: "failed at https://redacted@example.test/%zz?password=REDACTED after",
 		},
 		{
 			name: "empty stays empty",

@@ -56,17 +56,13 @@ var credentialKeys = map[string]bool{
 //     a fragment is never sent to the server anyway;
 //   - the VALUES of credential-like query parameters, with the key preserved.
 //
-// A string that does not parse as a URL is returned with a best-effort
-// fragment strip rather than being dropped: console messages embed URLs in free
-// text, and losing the diagnostic entirely would be worse than an imperfect
-// redaction.
+// A string that does not parse as a URL is redacted by inspecting its URL
+// delimiters directly. Console messages can contain malformed URLs, but their
+// diagnostics must not be allowed to bypass credential redaction.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		if i := strings.IndexByte(raw, '#'); i >= 0 {
-			return raw[:i]
-		}
-		return raw
+		return redactMalformedURL(raw)
 	}
 
 	if u.User != nil {
@@ -76,26 +72,53 @@ func RedactURL(raw string) string {
 	u.RawFragment = ""
 
 	if u.RawQuery != "" {
-		q := u.Query()
-		changed := false
-		for k, vs := range q {
-			if !credentialKeys[strings.ToLower(k)] {
-				continue
-			}
-			for i := range vs {
-				if vs[i] != "" {
-					vs[i] = RedactedValue
-					changed = true
-				}
-			}
-			q[k] = vs
-		}
-		if changed {
-			u.RawQuery = q.Encode()
-		}
+		u.RawQuery = redactRawQuery(u.RawQuery)
 	}
 
 	return u.String()
+}
+
+// redactRawQuery processes each pair independently. URL.Query silently drops
+// pairs containing malformed escapes, which is unsafe for a redaction helper.
+func redactRawQuery(raw string) string {
+	pairs := strings.Split(raw, "&")
+	for i, pair := range pairs {
+		key, value, found := strings.Cut(pair, "=")
+		if !found || value == "" {
+			continue
+		}
+		decodedKey, err := url.QueryUnescape(key)
+		if err != nil {
+			decodedKey = key
+		}
+		if credentialKeys[strings.ToLower(decodedKey)] {
+			pairs[i] = key + "=" + RedactedValue
+		}
+	}
+	return strings.Join(pairs, "&")
+}
+
+func redactMalformedURL(raw string) string {
+	if i := strings.IndexByte(raw, '#'); i >= 0 {
+		raw = raw[:i]
+	}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		query := redactRawQuery(raw[i+1:])
+		raw = raw[:i+1] + query
+	}
+
+	if scheme := strings.Index(raw, "://"); scheme >= 0 {
+		authorityStart := scheme + 3
+		authorityEnd := len(raw)
+		if i := strings.IndexAny(raw[authorityStart:], "/?"); i >= 0 {
+			authorityEnd = authorityStart + i
+		}
+		if at := strings.LastIndexByte(raw[authorityStart:authorityEnd], '@'); at >= 0 {
+			at += authorityStart
+			raw = raw[:authorityStart] + RedactedUser + raw[at:]
+		}
+	}
+	return raw
 }
 
 // urlInTextRe finds absolute http(s) URLs embedded in free text. The character
