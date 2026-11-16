@@ -20,7 +20,7 @@ request. If all you need is "is the link dead", use a link checker.
 
 ## Install
 
-Requires **Go 1.26.6 or newer** and **Google Chrome or Chromium**.
+Requires **Go 1.26.11 or newer** and **Google Chrome or Chromium**.
 
 ```sh
 go build -o pagevet ./cmd/pagevet
