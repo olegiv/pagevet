@@ -1,6 +1,6 @@
 module github.com/olegiv/pagevet
 
-go 1.26.6
+go 1.26.11
 
 require (
 	github.com/chromedp/cdproto v0.0.0-20260714215040-dc233986426f
