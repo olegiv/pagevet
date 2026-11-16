@@ -1,17 +1,25 @@
-# golangci-lint v1 SCHEMA (validated against v1.64.8).
-# Do NOT migrate to v2 syntax without bumping the binary: the v2 keys
-# `version:`, `linters.default:`, `linters.settings:` and `formatters:` are
-# silently rejected by v1, which would leave this project effectively unlinted.
+# golangci-lint v2 SCHEMA (validated against v2.11.4).
 #
-# staticcheck / gosimple / stylecheck are BUNDLED in golangci-lint; do not
-# install honnef.co/go/tools separately.
+# Migrated from the v1 schema with `golangci-lint migrate`. Do NOT hand-edit
+# this back to v1 keys (`linters.disable-all`, `linters-settings`, a top-level
+# `run.timeout`): v2 rejects them outright, which is a loud failure rather than
+# a silent one, but it still leaves you unlinted until you notice.
+#
+# Two things changed meaning in the v1 -> v2 move and are worth knowing:
+#
+#   * gosimple and stylecheck no longer exist as separate linters. Both are
+#     folded into staticcheck, so the enable list below is shorter than the v1
+#     one without checking any less.
+#   * run.timeout is gone; v2 has no timeout by default. The lint run takes
+#     well under a minute on this codebase, so nothing replaces it.
+
+version: "2"
 
 run:
-  timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - bodyclose
     - contextcheck
@@ -20,7 +28,6 @@ linters:
     - errorlint
     - gocritic
     - gosec
-    - gosimple
     - govet
     - ineffassign
     - misspell
@@ -32,7 +39,6 @@ linters:
     - prealloc
     - revive
     - staticcheck
-    - stylecheck
     - unconvert
     - unparam
     - unused
@@ -40,44 +46,75 @@ linters:
     - usetesting
     - wastedassign
 
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    # check-blank stays OFF. In Go, `_ = f()` is the idiomatic way to say
-    # "I looked at this error and it is not actionable", and the handful of
-    # sites that do it here are all of that kind: dismissing a dialog on a tab
-    # that may already be closing, the post-load settle sleep, the polite
-    # browser shutdown before we kill the process anyway. Each carries a
-    # comment saying why. Turning this on would replace those explicit,
-    # greppable blanks with wrapper functions that hide the same decision.
-    # Genuinely unchecked returns - the case that matters - are still caught.
-    check-blank: false
-  govet:
-    enable-all: true
-    disable:
-      # Field alignment is a micro-optimization that fights readability in the
-      # Result struct, whose field order is documentation.
-      - fieldalignment
-  gosec:
-    config:
-      G301: "0700"
-      G302: "0600"
-      G306: "0600"
-  nolintlint:
-    # Any suppression that survives must name its rule and justify itself.
-    allow-unused: false
-    require-explanation: true
-    require-specific: true
-  misspell:
-    locale: US
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # check-blank stays OFF. In Go, `_ = f()` is the idiomatic way to say
+      # "I looked at this error and it is not actionable", and the handful of
+      # sites that do it here are all of that kind: dismissing a dialog on a tab
+      # that may already be closing, the post-load settle sleep, the polite
+      # browser shutdown before we kill the process anyway. Each carries a
+      # comment saying why. Turning this on would replace those explicit,
+      # greppable blanks with wrapper functions that hide the same decision.
+      # Genuinely unchecked returns - the case that matters - are still caught.
+      check-blank: false
+
+    govet:
+      enable-all: true
+      disable:
+        # Field alignment is a micro-optimization that fights readability in the
+        # Result struct, whose field order is documentation.
+        - fieldalignment
+
+    gosec:
+      # Advisory only: `make sec` runs a standalone gosec with gosec.json and is
+      # authoritative. These values mirror it so the two do not disagree.
+      config:
+        G301: "0700"
+        G302: "0600"
+        G306: "0600"
+
+    nolintlint:
+      # Any suppression that survives must name its rule and justify itself.
+      # There are currently none, and `make sec` reports Nosec: 0 to match.
+      allow-unused: false
+      require-explanation: true
+      require-specific: true
+
+    misspell:
+      locale: US
+
+  exclusions:
+    generated: lax
+    # These four presets are what v1 applied by default via
+    # `issues.exclude-use-default: true`. v2 makes them explicit, and dropping
+    # them is what makes an otherwise-identical config report several dozen
+    # findings about unchecked fmt.Fprintf and gosec in test files.
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Table-driven tests legitimately carry long literal blocks and duplicated
+      # setup; the value is in the coverage, not in the DRY-ness.
+      - path: _test\.go
+        linters:
+          - gocritic
+          - unparam
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    # Table-driven tests legitimately carry long literal blocks and duplicated
-    # setup; the value is in the coverage, not in the DRY-ness.
-    - path: _test\.go
-      linters:
-        - unparam
-        - gocritic
+
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

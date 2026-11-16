@@ -23,8 +23,12 @@ import (
 )
 
 // Compile-time proof that the fake is substitutable for the real browser
-// loader. If the interface ever changes, this line breaks before any test does.
-var _ loader.PageLoader = (*FakeLoader)(nil)
+// loader. If either interface ever changes, these lines break before any test
+// does.
+var (
+	_ loader.PageLoader    = (*FakeLoader)(nil)
+	_ loader.Authenticator = (*FakeLoader)(nil)
+)
 
 // LoadFunc is a full manual override of Load's answer, installed by SetFunc.
 // It receives exactly what Load received.
@@ -58,6 +62,13 @@ type FakeLoader struct {
 	calls    []string
 	inFlight int
 	peak     int
+
+	loginErr   error
+	loginCalls int
+	// loginAtCall records how many Loads had already happened when Login was
+	// called. It is what proves the ordering the whole feature rests on: a
+	// login that lands after the first page load is a login that did nothing.
+	loginAtCall int
 }
 
 // New returns a FakeLoader whose default answer is a clean 200 page.
@@ -143,6 +154,49 @@ func (f *FakeLoader) Load(ctx context.Context, index int, rawURL string) (verdic
 	}
 	res, err := f.scriptFor(rawURL)
 	return stamp(res, index, rawURL), err
+}
+
+// SetLoginErr scripts what Login returns. Nil, the default, is a successful
+// sign-in.
+func (f *FakeLoader) SetLoginErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loginErr = err
+}
+
+// Login implements loader.Authenticator.
+//
+// It performs no authentication — there is nothing here to authenticate
+// against. What it records is the two things the app layer's contract with a
+// real browser actually turns on: that Login was called exactly once, and that
+// it was called before any page was loaded.
+func (f *FakeLoader) Login(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.loginCalls++
+	f.loginAtCall = len(f.calls)
+	return f.loginErr
+}
+
+// LoginCalls returns how many times Login was entered. Anything but 1 on a
+// -login run is a bug: 0 means the crawl went out anonymous, and 2 means a
+// second sign-in raced the pool.
+func (f *FakeLoader) LoginCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loginCalls
+}
+
+// LoadsBeforeLogin returns how many Load calls had already been entered when
+// Login ran. It must be 0: a session established after the first page load did
+// not apply to that page.
+func (f *FakeLoader) LoadsBeforeLogin() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loginAtCall
 }
 
 // Calls returns the URLs passed to Load, in dispatch order.

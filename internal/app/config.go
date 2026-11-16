@@ -18,8 +18,39 @@ import (
 	"time"
 )
 
-// Version is the reported build version.
-const Version = "0.1.0"
+// Version is the reported build version. Commit and BuildTime are written by
+// the linker at build time - see `make build-prod` - which is why all three are
+// `var` and not `const`: -X patches a package-level string VARIABLE, and aimed
+// at a constant it does nothing and reports nothing.
+//
+// Commit and BuildTime are empty by default rather than "unknown". A plain
+// `go build ./cmd/pagevet` - what README documents, what the e2e test compiles
+// and what `go test` links - then prints exactly what it printed before
+// stamping existed, instead of "pagevet 0.1.0 (unknown, unknown)".
+var (
+	Version   = "0.1.0"
+	Commit    string
+	BuildTime string
+)
+
+// versionLine renders the -version output.
+//
+// It takes its three values as arguments rather than reading the package
+// variables so that both renderings are testable without writing to globals
+// from a test. The parenthetical appears only for the parts the linker actually
+// stamped, so an unstamped build is byte-identical to the pre-stamping output.
+func versionLine(version, commit, buildTime string) string {
+	switch {
+	case commit != "" && buildTime != "":
+		return fmt.Sprintf("pagevet %s (%s, %s)", version, commit, buildTime)
+	case commit != "":
+		return fmt.Sprintf("pagevet %s (%s)", version, commit)
+	case buildTime != "":
+		return fmt.Sprintf("pagevet %s (%s)", version, buildTime)
+	default:
+		return "pagevet " + version
+	}
+}
 
 // Exit codes. The split between 1 and 3 is what makes this usable in CI: a
 // broken URL is a DATA outcome, whereas a browser that would not start is a
@@ -30,6 +61,7 @@ const (
 	ExitUsage       = 2 // bad flags, or an unusable input file
 	ExitInternal    = 3 // the tool itself failed: no Chrome, unwritable logs
 	ExitInterrupted = 4 // SIGINT/SIGTERM; partial results were written
+	ExitLoginFailed = 5 // -login was set and the sign-in did not take
 )
 
 // ErrUsage marks a configuration problem that should exit with ExitUsage and a
@@ -64,6 +96,11 @@ type Config struct {
 
 	LogFullURLs    bool
 	AllowLinkLocal bool
+
+	// Login signs in once before the crawl, reading login.DefaultPath for the
+	// form spec and the account. The session then applies to every URL, because
+	// all of them are loaded in tabs of one browser.
+	Login bool
 
 	FailOnErrors bool
 
@@ -119,6 +156,27 @@ Browser:
                        "HeadlessChrome", which some sites answer with 403.
   -debug-chrome        forward Chrome's stdout/stderr to this process's stderr
 
+Authentication:
+  -login               sign in once before crawling and reuse that session for
+                       every URL, so pages behind a login report their real
+                       errors instead of a redirect. Reads ./.env in the CURRENT
+                       directory - every key but LOGOUT_PATH is required:
+                         LOGIN_PATH      login page: a path resolved against the
+                                         first URL in the input file, or a full
+                                         http(s):// URL
+                         LOGOUT_PATH     optional. A sign-out page loaded just
+                                         BEFORE the login page, so the sign-in
+                                         starts signed out. Omit to go straight
+                                         to the login page.
+                         LOGIN_FORM_ID   id of the <form> element
+                         USERNAME_NAME   name= of the username input
+                         PASSWORD_NAME   name= of the password input
+                         USER_ADMIN_NAME the account to sign in as
+                         USER_ADMIN_PASS its password
+                       See .env.example. Keep .env mode 0600: it holds a
+                       password. The session lives in the run's throwaway Chrome
+                       profile and is destroyed with it. (default false)
+
 Safety:
   -log-full-urls       write URLs verbatim. By default userinfo is stripped, the
                        fragment is dropped, and the VALUES of credential-like
@@ -138,9 +196,11 @@ Other:
 Exit codes:
   0  the run completed (URLs may still have had errors - see the summary)
   1  only with -fail-on-errors: the run completed and some URLs had errors
-  2  usage error, or the input file is missing / unreadable / has no valid URLs
+  2  usage error, or the input file is missing / unreadable / has no valid URLs,
+     or .env is missing / malformed when -login is set
   3  internal failure (could not start Chrome, could not write the logs)
   4  interrupted by SIGINT/SIGTERM (partial results written, summary printed)
+  5  only with -login: the sign-in failed, so nothing was crawled
 
 Notes:
   * Output is never colorized.
@@ -148,6 +208,8 @@ Notes:
     supplied, which can carry credentials. See -log-full-urls.
   * Refuses to run as root: Chrome would be started with --no-sandbox, which
     disables the OS sandbox around a renderer parsing untrusted pages.
+  * -login never writes the password anywhere: not to a log, not into an error
+    message, not into the JavaScript it evaluates.
 `
 
 // ParseFlags parses argv into a validated Config.
@@ -187,6 +249,8 @@ func ParseFlags(args []string, out io.Writer) (Config, error) {
 
 	fs.BoolVar(&c.LogFullURLs, "log-full-urls", false, "write URLs verbatim (UNSAFE)")
 	fs.BoolVar(&c.AllowLinkLocal, "allow-link-local", false, "allow link-local hosts")
+
+	fs.BoolVar(&c.Login, "login", false, "sign in once before crawling, using ./.env")
 
 	fs.BoolVar(&c.FailOnErrors, "fail-on-errors", false, "exit 1 when any URL had an error")
 	fs.BoolVar(&c.ShowVersion, "version", false, "print version and exit")

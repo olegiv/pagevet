@@ -37,6 +37,21 @@ type Browser struct {
 	opts     Options
 	product  string // e.g. "Chrome/151.0.7922.138"
 	closeOne sync.Once
+
+	// hostChecked memoizes Options.CheckHost per hostname.
+	//
+	// A sign-in validates up to five addresses — the logout page, the login
+	// page, the form's target before and after the fields are filled, and where
+	// the submission landed — and they are usually all the same host. Each
+	// check is a DNS lookup, and an mDNS ".local" name costs five seconds a
+	// time, which was enough to spend the entire per-URL budget on resolving
+	// one host over and over.
+	//
+	// Caching adds no weakness: the answer for a host cannot change within a
+	// run in any way this program could act on, and input.CheckHost is already
+	// documented as a pre-flight check vulnerable to TOCTOU and DNS rebinding.
+	hostMu      sync.Mutex
+	hostChecked map[string]error
 }
 
 var _ PageLoader = (*Browser)(nil)
@@ -62,7 +77,11 @@ func NewChrome(o Options) (*Browser, error) {
 	// Start from chromedp's defaults, which already include a fresh temporary
 	// user-data-dir. That temp profile is a security property, not an
 	// implementation detail: it means no cookies, no logins and no extensions
-	// from the user's real profile are ever exposed to a crawled page.
+	// from the user's REAL profile are ever exposed to a crawled page.
+	//
+	// -login does not weaken this. It signs in inside this throwaway profile,
+	// so the session it creates is one this run established and one that dies
+	// with the profile when allocCancel removes the directory. See Login.
 	allocOpts := make([]chromedp.ExecAllocatorOption, 0, len(chromedp.DefaultExecAllocatorOptions)+8)
 	allocOpts = append(allocOpts, chromedp.DefaultExecAllocatorOptions[:]...)
 	allocOpts = append(allocOpts,

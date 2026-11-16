@@ -980,6 +980,10 @@ func runMain(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	return code, out.String(), errOut.String()
 }
 
+// The expectation is deliberately the UNSTAMPED rendering. A `go test` binary
+// is linked without -X, so app.Commit and app.BuildTime are empty and -version
+// prints the same single line it printed before stamping existed. The stamped
+// forms are covered by TestVersionLine.
 func TestMain_Version(t *testing.T) {
 	t.Parallel()
 

@@ -62,6 +62,11 @@ type headerRecord struct {
 	Timeout     string `json:"timeout,omitempty"`
 	Settle      string `json:"settle,omitempty"`
 	Chrome      string `json:"chrome,omitempty"`
+
+	// Login is omitted entirely on a run without -login, so an existing
+	// consumer of these files sees no new field until authentication is
+	// actually in play. It never carries a password.
+	Login string `json:"login,omitempty"`
 }
 
 // encodeJSON renders v as a single line, without the trailing newline the
@@ -159,6 +164,7 @@ func (r *Reporter) headerJSON(name string) (string, error) {
 		Input:       h.Input,
 		Concurrency: h.Concurrency,
 		Chrome:      h.Chrome,
+		Login:       h.Login,
 	}
 	if h.Timeout > 0 {
 		rec.Timeout = h.Timeout.String()
